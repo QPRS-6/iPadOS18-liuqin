@@ -167,7 +167,10 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     size_t client_pending=0;
     for(const auto &pending:jobs_)if(pending.active && pending.pid==next_pid_)++client_pending;
     const bool low=next_priority_==2 || next_priority_==3;
-    const size_t cap=low?1:next_priority_==1?2:8;
+    // The render server needs to keep a frame or two in flight while its
+    // surface is being composed; two slots left it retrying (admitted_yields)
+    // during the boot widget storm and the first frames never completed.
+    const size_t cap=low?2:next_priority_==1?4:8;
     if(client_pending>=cap){++admission_yields_;return kIOReturnBusy;}
     const uint64_t began=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const unsigned cache_context=queue/NativeAdrenoAbiMaxQueues;

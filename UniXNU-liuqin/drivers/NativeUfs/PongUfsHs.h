@@ -371,6 +371,20 @@ static int pongSetHsGear() {
   return s_pm ? kIOReturnError : 0;
 }
 
+/* Read-only view of the link the boot loader left. PA_PWRMODE bits 7:4 are the
+ * mode (1 = fast/HS, 2 = slow/PWM) and bits 3:0 the gear; this never writes. */
+static void pongUfsLinkReport() {
+  uint32_t maxhs = 0, tx = 0, rx = 0, pm = 0, txl = 0, rxl = 0;
+  int e1 = pongUic(0x01, 0x1587u << 16, 0, 0, &maxhs);
+  int e2 = pongUic(0x01, 0x1568u << 16, 0, 0, &tx);
+  int e3 = pongUic(0x01, 0x1583u << 16, 0, 0, &rx);
+  int e4 = pongUic(0x01, 0x1571u << 16, 0, 0, &pm);
+  int e5 = pongUic(0x01, 0x1560u << 16, 0, 0, &txl);
+  int e6 = pongUic(0x01, 0x1580u << 16, 0, 0, &rxl);
+  IOLog("PONG_UFS: link maxhs=G%u txgear=G%u rxgear=G%u pwr=0x%x lanes=%u/%u err=%d%d%d%d%d%d\n",
+        maxhs, tx, rx, pm, txl, rxl, e1, e2, e3, e4, e5, e6);
+}
+
 static bool pongUfsHsBringUp() {
   if (gPongUfsHsActive) return true;
   if (gPongUfsHsTried) return false;

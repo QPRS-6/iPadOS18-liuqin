@@ -157,7 +157,14 @@ static id openDevice(unsigned port)
       if(strstr(args,"pong_gpu_trace=1")){setenv("SHENG_GPU_TRACE","1",1);setenv("SHENG_DIAG","1",1);}
       if(strstr(args,"pong_gpu_pixels=1"))setenv("SHENG_GPU_PIXELS","1",1);
      }}
-    setenv("TU_DEBUG","sysmem,nocb",1);
+    // GMEM on, UBWC off: the wallpaper/composited surfaces showed green band
+    // artifacts when the CPU read compressed layouts. nocb stays. A boot line
+    // may force the system-memory renderer for an A/B of the GMEM store path.
+    setenv("TU_DEBUG","noubwc,nocb",1);
+    {char args[1024]={};size_t size=sizeof args;
+     if(!sysctlbyname("kern.bootargs",args,&size,nullptr,0) &&
+        strstr(args,"pong_gpu_sysmem=1"))setenv("TU_DEBUG","sysmem,noubwc,nocb",1);
+    }
     // Pong implements NativeAdreno directly, not Sheng's AGX selector tunnel.
     setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
     setenv("TU_DARWIN_OPEN_TYPE","0x4147",1);

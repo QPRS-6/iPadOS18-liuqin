@@ -1638,6 +1638,22 @@ def refresh_metal(a):
             if path.is_symlink(): raise RuntimeError('Plugin must contain ordinary owned files')
             os.chown(path, 0, 0)
             os.chmod(path, 0o755 if path.is_dir() or path.name != 'Info.plist' else 0o644)
+        # iOS keeps a client's whole GPU stack inside cameracaptured, so the
+        # stock 27 MB inactive hard limit (J171/J172) ends that service about
+        # half a second after launch. It then respawns forever and every app
+        # render (wallpaper previews, snapshots, selections) is lost midway.
+        for jetsam in (out / 'system-mount/System/Library/LaunchDaemons').glob(
+                'com.apple.jetsamproperties.*.plist'):
+            data = plistlib.loads(jetsam.read_bytes().lstrip())
+            override = data.get('Version4', {}).get('Daemon', {}).get('Override', {})
+            entry = override.get('com.apple.cameracaptured')
+            if not isinstance(entry, dict) or entry.get('InactiveHardMemoryLimit') == -1:
+                continue
+            entry['InactiveHardMemoryLimit'] = -1
+            jetsam.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
+            os.chown(jetsam, 0, 0)
+            os.chmod(jetsam, 0o644)
+            print('jetsam: cameracaptured inactive hard limit -> unlimited (' + jetsam.name + ')')
     finally:
         run(['hdiutil', 'detach', device])
     dump(runtime / 'os-metal-update.json', dict(build='22H374',

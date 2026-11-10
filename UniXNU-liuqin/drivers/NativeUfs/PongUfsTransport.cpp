@@ -376,6 +376,22 @@ static bool hostBringUp() {
   uint32_t last = loadBe32(gHost.virt + kDataOffset), blockSize = loadBe32(gHost.virt + kDataOffset + 4);
   if (!last || last == 0xffffffff || blockSize != 4096) return transportFailure("unsupported LUN geometry");
   gHost.blocks = uint64_t(last) + 1;
+  /* Read-only link/throughput diagnosis, after READ CAPACITY so the block count
+   * above is known: time eight 128 KiB reads (LBA 0..255) before publication. */
+  pongUfsLinkReport();
+  {
+    const uint64_t began = mach_absolute_time();
+    uint32_t blocks = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+      if (hostRead4kLocked(0, uint64_t(i) * 32, 32) != kIOReturnSuccess) break;
+      blocks += 32;
+    }
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+    const uint64_t kib = uint64_t(blocks) * 4;
+    IOLog("PONG_UFS: link read %llu KiB in %llu us (%llu MiB/s)\n", kib, ns / 1000,
+          ns ? kib * 1000000000ull / ns / 1024 : 0);
+  }
   IOLog("PONG_UFS: transport ready LUN=0 block=4096 blocks=%llu; WRITE(10) FUA=%s; writes stay inside declared SHNGROOT windows\n",
         gHost.blocks, gHost.writable ? "enabled" : "disabled");
   __atomic_store_n(&gWifiUfsReady,1,__ATOMIC_RELEASE);

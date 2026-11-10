@@ -2101,6 +2101,9 @@ commandQueueLimit(NSUInteger requested)
   * inside the display's 500 ms window. */
  if(name && (!strcmp(name,"backboardd") || !strcmp(name,"SpringBoard")))limit=3;
  else if(name && (strstr(name,"Poster") || !strcmp(name,"WidgetRenderer_Default")))limit=8;
+ /* A camera preview that keeps 64 buffers queued holds surfaces and VA the
+  * compositor needs. Bound it like a background renderer. */
+ else if(name && !strcmp(name,"cameracaptured"))limit=8;
  if(!limit)limit=1;
  return limit;
 }

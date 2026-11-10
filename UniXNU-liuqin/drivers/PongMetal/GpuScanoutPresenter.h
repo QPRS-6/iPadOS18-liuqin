@@ -38,6 +38,8 @@ public:
         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
     }
     bool ready() const { return target_ != nil; }
+    // MTLCommandBuffer.error.code of the last present(), for the failure log.
+    int lastError() const { return lastError_; }
     // Called only after a frame was refused before any command submission.
     void resetSources() {for(auto &source:sources_)source={};}
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
@@ -76,6 +78,7 @@ public:
             [encoder dispatchThreadgroups:MTLSizeMake((frame.width+15)/16,(frame.height+7)/8,1)
                    threadsPerThreadgroup:MTLSizeMake(16,8,1)];
             [encoder endEncoding];[commands commit];[commands waitUntilCompleted];
+            lastError_=commands.error?(int)commands.error.code:0;
             return commands.status==MTLCommandBufferStatusCompleted?kOk:kGpuFailed;
         }
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
@@ -111,6 +114,7 @@ public:
         [blit endEncoding];
         [commands commit];
         [commands waitUntilCompleted];
+        lastError_=commands.error?(int)commands.error.code:0;
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
 private:
@@ -128,7 +132,7 @@ private:
     struct Source {uint32_t key=0;const void *base=nullptr;size_t bytes=0;uint64_t used=0;id<MTLBuffer> buffer=nil;id<MTLTexture> texture=nil;size_t stride=0;};
     // Bound imported scanout BOs to the compositor's triple buffer.
     // Every retained import participates in the non-coherent DMA handoff.
-    Source sources_[3];uint64_t use_=0;
+    Source sources_[3];uint64_t use_=0;int lastError_=0;
     bool validScanout() const {
         const size_t page = (size_t)getpagesize();
         return scanout_.base && !((uintptr_t)scanout_.base & (page - 1)) && scanout_.bytes && !(scanout_.bytes & (page - 1)) &&

@@ -14,7 +14,9 @@ SDK, firmware blobs, or host toolchains.
 iPadOS18-liuqin/
   UniXNU-liuqin/        device repository: kernel drivers, XNU patch series,
                         userland, build kits, board config (board.toml,
-                        configs/liuqin-board.json, dts/liuqin.dts, porting.toml)
+                        configs/liuqin-board.json, dts/liuqin.dts, porting.toml);
+                        build and directory guides in docs/BUILD.zh.md and
+                        docs/LAYOUT.zh.md
   UniXNU-sheng/         shared Sheng package sources the device build links
                         (QcomRpmh, AppleARMBacklight reference, probes)
   metal/
@@ -41,7 +43,10 @@ iPadOS18-liuqin/
 
 ## Build entry points
 
-The device repository owns the toolchain and the kernel preparation:
+The device repository owns the toolchain and the kernel preparation. A
+from-zero walkthrough (host tools, XNU checkouts, SDK/MIG, ADT, Metal stack,
+root image) is in [`UniXNU-liuqin/docs/BUILD.zh.md`](UniXNU-liuqin/docs/BUILD.zh.md)
+(Chinese), with the directory map in `docs/LAYOUT.zh.md`.
 
 ```sh
 cd UniXNU-liuqin
@@ -63,7 +68,7 @@ cargo build --release --target aarch64-apple-ios --features ipados18
 `Cargo.toml` currently carries the author's absolute paths for the frontend
 object and the local `metal2vulkan` checkout; adjust them for your tree.
 
-## Device status at the time of this drop (2026-11-09)
+## Device status at the time of this drop (2026-11-10)
 
 Verified on hardware:
 
@@ -84,6 +89,32 @@ Not enabled yet:
   `CONFIG_XNU_PONG_POWER=n` / `CONFIG_XNU_PONG_BACKLIGHT=n`.
 - Battery, sensors, stylus, audio, Bluetooth and Wi-Fi remain work in progress;
   see `UniXNU-liuqin/porting.toml`.
+
+## Changes in the 2026-11-10 refresh
+
+Nineteen files in `UniXNU-liuqin/` (5 added, 14 modified) on top of the
+previous drop — display path, build docs and the touch driver:
+
+- `pong_fb_flip`: double-buffered scanout. Each frame is written into the
+  buffer the display pipe is not fetching, the pipe's source address is
+  repointed and the control path flushed; after three flips that are not taken
+  it falls back to the boot loader's buffer. Ported from HakiOS/mayfly
+  (`fb_flip`) — `patches/xnu-ipados18/…-pong-fb-flip.patch`.
+- `pong_fb_blend` (same patch, default 1): kernel composition blends by real
+  alpha instead of forcing every pixel opaque, which removes the colour bars
+  where a composited sheet carries uninitialised RGB behind transparent pixels.
+- Scanout fallback: `SWAP_GPU_MS` raised 500 → 1000 ms, and when no GPU frame
+  completed the CPU composition path is permitted again instead of returning
+  `kIOReturnNotReady` (`pong_scanout_fallback`) — `…-pong-scanout-fallback.patch`.
+- `pong-io-map-64m`: the kernel I/O map window grows from 8 MB to 64 MB
+  (`osfmk/arm/io_map.c`).
+- GPU presenters reworked: `GpuScanoutPresenter.h` copies pitched BGRA rows in
+  one dispatch and supplies opaque alpha upstream; scanout and submit paths
+  (`PongAdrenoScanout.cpp`, `NativeAdreno{Publish,Submit}.cpp`), UFS transport
+  and the NT36532 touch patch updated as well.
+- New `docs/BUILD.zh.md` (from-zero build) and `docs/LAYOUT.zh.md` (directory
+  map); the device README gained a full acknowledgement list of the upstream
+  components this port derives from.
 
 ## Licensing
 

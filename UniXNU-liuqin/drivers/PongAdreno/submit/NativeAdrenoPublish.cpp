@@ -150,9 +150,15 @@ static NativeAdrenoClientWindow clientWindow(unsigned slot,const char *name)
     // MercuryPoster hit real device-VA OOM with128MiB while importing its
     // FP16 targets. Prefer384MiB for posters,256MiB for input/preferences,
     //128MiB otherwise. Search actual holes; never relocate a live mapping.
-    uint64_t preferred=poster?0x18000000ull:
-        (!strcmp(name,"InputUI") || !strcmp(name,"Preferences"))?0x10000000ull:0x08000000ull;
-    for(uint64_t amount=preferred;amount>=0x04000000ull;amount-=0x04000000ull) {
+    // Posters still get384MiB (their FP16 targets), but every other client now
+    // asks for64MiB: the32-bit GPU VA pool fragmented below the old128MiB
+    // default during the boot widget storm and mount failed with no space.
+    uint64_t preferred=poster?0x0c000000ull:
+        (!strcmp(name,"InputUI") || !strcmp(name,"Preferences"))?0x08000000ull:0x04000000ull;
+    // Keep the per-client window unchanged while space is free. Under
+    // pressure, step down in 32 MiB units so a fragmented pool can still
+    // place a small lease instead of failing the mount with no space.
+    for(uint64_t amount=preferred;amount>=0x02000000ull;amount-=0x02000000ull) {
         uint64_t start=0x90000000ull;
         for(unsigned pass=0;pass<=NativeAdrenoMaxClients && start+amount<=0x100000000ull;++pass) {
             uint64_t next=start;
@@ -214,12 +220,41 @@ public:
 };
 OSDefineMetaClassAndStructors(AGXDeviceUserClient,IOUserClient)
 
+static void nativeAdrenoLogText(const char *tag,const char *who,const char *text)
+{
+    if(!text || !text[0])return;
+    if(who && who[0])IOLog("PONG TEXT %s %s: %.62s\n",tag,who,text);
+    else IOLog("PONG TEXT %s %.62s\n",tag,text);
+}
+
 void nativeAdrenoMailboxPoller(void *,wait_result_t)
 {
     thread_set_thread_name(current_thread(),"sheng-gpu-mailbox");
     uint32_t last=0;
+    /* The Metal bridge's failure lines are kept in these buffers only. A line
+     * that is never replaced by another would otherwise never reach the log,
+     * so flush the changed ones about every ten seconds. */
+    static char seenReport[64],seenReport2[64],seenClient[NativeAdrenoMaxClients][64];
+    uint32_t textTicks=0;
     for(;;) {
         IOSleep(1);
+        if(++textTicks>=10000) {
+            textTicks=0;
+            if(strcmp(native_adreno_metal_diag.report,seenReport)) {
+                strlcpy(seenReport,native_adreno_metal_diag.report,sizeof seenReport);
+                nativeAdrenoLogText("r",NULL,native_adreno_metal_diag.report);
+            }
+            if(strcmp(native_adreno_metal_diag.report2,seenReport2)) {
+                strlcpy(seenReport2,native_adreno_metal_diag.report2,sizeof seenReport2);
+                nativeAdrenoLogText("r2",NULL,native_adreno_metal_diag.report2);
+            }
+            for(unsigned i=0;i<NativeAdrenoMaxClients;i++) {
+                if(strcmp(native_adreno_client_text[i].text,seenClient[i])) {
+                    strlcpy(seenClient[i],native_adreno_client_text[i].text,sizeof seenClient[i]);
+                    nativeAdrenoLogText("p",native_adreno_client_text[i].name,native_adreno_client_text[i].text);
+                }
+            }
+        }
         if(!gMailboxOwner || !gMailboxWords)continue;
         const uint32_t request=gMailboxWords[1];
         if(request==last || request==gMailboxWords[2])continue;
@@ -792,6 +827,14 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
             static char *line=native_adreno_metal_diag.report2;
             static_assert(sizeof(native_adreno_metal_diag.report)==sizeof(native_adreno_metal_diag.report2),"stream lines");
             if(value==0x7fff || value==0x7ffe) {
+                /* Keep the line the stream is replacing in the console log: the
+                 * Metal bridge sends its first refused/failed path here and the
+                 * 4 MiB PONGLOG ring is the only channel off this board. */
+                if(line[0]) {
+                    char previous[20]={};
+                    proc_selfname(previous,sizeof previous);
+                    IOLog("PONG TEXT %s %s: %.62s\n",previous,value==0x7fff?"r2":"r7",line);
+                }
                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */

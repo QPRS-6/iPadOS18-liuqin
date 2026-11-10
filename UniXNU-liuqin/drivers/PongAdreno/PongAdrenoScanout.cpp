@@ -18,6 +18,12 @@ IOMemoryDescriptor *scanout;
 task_t client;
 PongScanoutModeInfo mode{};
 bool waiting=false,workerReady=false,poisoned=false,idleNotify=false;
+/* A copy the presenter reported as completed with a GPU error is retired:
+ * nothing may still write the pages. Retry a couple of times with fresh
+ * imports; only then stop GPU scanout and let the framebuffer compose on the
+ * CPU instead of freezing on the last frame. */
+uint32_t gpuFailures=0;
+bool fallback=false;
 uint64_t sequence=0,completed=0,sourceUse=0;
 uint32_t nextSource=1;
 struct Source {IOMemoryDescriptor *owner=nullptr,*memory=nullptr;IOMemoryMap *map=nullptr;
@@ -105,6 +111,11 @@ extern "C" bool pong_scanout_quarantined(void)
     if(!scanout_gate)return false;
     IOLockLock(scanout_gate);bool blocked=poisoned;IOLockUnlock(scanout_gate);return blocked;
 }
+extern "C" bool pong_scanout_fallback(void)
+{
+    if(!scanout_gate)return false;
+    IOLockLock(scanout_gate);bool value=fallback;IOLockUnlock(scanout_gate);return value;
+}
 extern "C" void pong_scanout_idle(void)
 {
     if(!scanout_gate)return;
@@ -139,7 +150,16 @@ extern "C" IOReturn pong_scanout_call(task_t owner,unsigned op,const void *in,si
         gpuTraceEvent(GpuTraceDisplayFence,0,q.sequence,q.status?2:1,q.sequence,q.sequence,q.status?0:q.sequence,0,0,0,q.status);
         pending.status=q.status;pending.done=true;
         if(q.status==PongScanoutNotSubmitted)workerReady=false;
-        if(q.status && q.status!=PongScanoutNotSubmitted)poisoned=true;
+        else if(q.status==kIOReturnError) {
+            // The presenter waited for the command buffer and reported a GPU
+            // failure. The copy is retired, so this is not unknown DMA:
+            // retry with fresh imports, then fall back to CPU composition.
+            if(++gpuFailures>=3) {
+                fallback=true;workerReady=false;
+                note("GPU copy failed three times; CPU composition continues",pending.id,q.status);
+            } else note("GPU copy failed; retrying",pending.id,q.status);
+        } else if(q.status)poisoned=true;
+        else gpuFailures=0;
         IOLockWakeup(scanout_gate,&pending,false);IOLockUnlock(scanout_gate);return kIOReturnSuccess;
     }
     if(op!=PongScanoutWait || !in || inBytes!=sizeof(PongScanoutWaitInfo) || !out || outBytes!=sizeof(PongScanoutFrame)) {
@@ -177,6 +197,7 @@ extern "C" int pong_scanout_frame(IOMemoryDescriptor *source,size_t offset,uint3
     if(!scanout_gate || !source || stride<uint64_t(width)*4 || width!=mode.width || height!=mode.height || (offset&4095))return 0;
     IOLockLock(scanout_gate);
     if(poisoned){IOLockUnlock(scanout_gate);return 2;}
+    if(fallback){IOLockUnlock(scanout_gate);return 0;}
     if(!client || !workerReady || pending.offered){IOLockUnlock(scanout_gate);return 0;}
     size_t bytes=(size_t(stride)*height+4095)&~size_t(4095);
     if(offset>source->getLength() || bytes>source->getLength()-offset){IOLockUnlock(scanout_gate);return 0;}
@@ -202,6 +223,12 @@ extern "C" int pong_scanout_frame(IOMemoryDescriptor *source,size_t offset,uint3
     while(!pending.done && !poisoned)
         if(IOLockSleepDeadline(scanout_gate,&pending,until,THREAD_UNINT)!=THREAD_AWAKENED)break;
     if(pending.delivered && (!pending.done || (pending.status && pending.status!=PongScanoutNotSubmitted))) {
+        if(pending.done && pending.status==kIOReturnError) {
+            // Reported GPU failure above retired the copy; show this frame on
+            // the CPU and let the next swap retry the GPU copy.
+            pending={};
+            IOLockUnlock(scanout_gate);return 0;
+        }
         poisoned=true;note("GPU copy not retired; retain pages and previous frame",pending.id,pending.status?:kIOReturnTimeout);
         IOLockUnlock(scanout_gate);return 2;
     }

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/pong_touch.c
-@@ -0,0 +1,6047 @@
+@@ -0,0 +1,6065 @@
 +/*
 + * LIUQIN touchscreen: Novatek NT36532 on GENI SPI4.
 + *
@@ -4539,6 +4539,11 @@
 +static volatile unsigned tch_hang_hits;
 +static volatile int tch_fw_dead;
 +static unsigned tch_fw_revive;
++/* Frame reads to ignore after the host poked INT itself: the edge that poke
++ * makes is ours, not a report from the controller, and must not decide a
++ * firmware hang (the keep-alive poke was reloading the firmware every few
++ * seconds that way). */
++static volatile unsigned tch_poke_grace;
 +/*
 + * touch181: the budget was 10, and every revive costs about 3 s of download
 + * plus the 30 s wait that triggers it - which is why "touch dies after 7-8
@@ -4645,6 +4650,7 @@
 +	delay(200);
 +	tch_bb_dir(21, false, 0);
 +	tch_wr(tch.tlmm, TLMM_CTL(21), (0u << 2) | (3u << 6));   /* mux 0 (GPIO), pull-up, input */
++	tch_poke_grace = 100;
 +	delay(1000);
 +	return false;
 +}
@@ -4720,6 +4726,10 @@
 +static void
 +tch_frame_streak(const uint8_t *frame, bool int_edge)
 +{
++	if (tch_poke_grace) {
++		tch_poke_grace--;
++		if (int_edge) return;
++	}
 +	if (tch_frame_valid(frame)) {
 +		tch_hang_hits = 0;
 +		return;
@@ -4738,14 +4748,17 @@
 +		 * the byte is what the part is waiting for rather than a boot step.
 +		 */
 +		(void)tch_nvt_write8(NVT_FW_STATUS_BYTE, 0x00);
-+		delay(5 * 1000);
-+		{
++		/* A lift, or a read that lands between two reports, also shows
++		 * 0xfd.  Give the part 200 ms (20 frames at its report rate) to
++		 * send a valid frame before paying for a re-download. */
++		for (unsigned wait = 0; wait < 20; wait++) {
 +			uint8_t again[NVT_POINT_LEN] = { 0 };
 +
++			delay(10 * 1000);
 +			if (tch_nvt_read(NVT_EVENT_BUF_ADDR, again, sizeof(again)) == 0 &&
 +			    tch_frame_valid(again)) {
-+				printf("LIUQIN TOUCH: firmware answered the 0x51 ack, "
-+				    "keeping it running\n");
++				printf("LIUQIN TOUCH: a valid frame arrived after the "
++				    "0x51 ack, keeping the firmware running\n");
 +				return;
 +			}
 +		}
@@ -5315,7 +5328,12 @@
 +				}
 +			}
 +		}
-+		if (tch_quiet_checks * (unsigned)period >= 30 &&
++		/* The panel naps after a lift; the INT wake (liuqintouchwake=1)
++		 * brings it back in milliseconds.  Keep the reload only as a
++		 * fallback for a part that does not wake at all. */
++		/* Only a last resort: a panel that answers no interrupt at all.
++		 * A real touch asserts INT and the frame streak above reloads it. */
++		if (tch_quiet_checks * (unsigned)period >= 300 &&
 +		    tch_fw_revive < TCH_REVIVE_MAX) {
 +			tch_fw_revive++;
 +			printf("LIUQIN TOUCH: revive %u: no contact frame for %u s, "

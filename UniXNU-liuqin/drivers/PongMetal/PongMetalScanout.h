@@ -13,7 +13,7 @@ using Map=kern_return_t(*)(unsigned,unsigned,mach_port_t,uint64_t *,uint64_t *,u
 struct Context {unsigned connection,version;Call call;gpupresent::Presenter *presenter;};
 static void *serve(void *opaque)
 {
-    auto *context=static_cast<Context *>(opaque);unsigned copies=0,refusals=0;
+    auto *context=static_cast<Context *>(opaque);unsigned copies=0,refusals=0,gpuFailures=0;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
     for(;;) {
         bool resetImports=false;
@@ -31,19 +31,49 @@ static void *serve(void *opaque)
                 continue;
             } else {
             if(status || bytes!=sizeof(frame) || (context->version==1 && frame.source_id) || frame.format!=PongScanoutBgra) {
-                report("scanout frame wait stopped",status?:-1);return nullptr;
+                // kIOReturnNotReady means the handoff is gone (client lost or
+                // unknown DMA): stop. Anything else is transient; keep the
+                // worker alive instead of leaving the display without one.
+                if(unsigned(status)==0xe00002d8 || bytes!=sizeof(frame) ||
+                   (context->version==1 && frame.source_id) || frame.format!=PongScanoutBgra) {
+                    report("scanout frame wait stopped",status?:-1);return nullptr;
+                }
+                report("scanout frame wait retrying",status?:-1);
+                usleep(10000);
+                continue;
             }
             auto result=context->presenter->present({reinterpret_cast<void *>(frame.address),size_t(frame.bytes),
                 size_t(frame.stride),frame.width,frame.height,context->version>=2?frame.source_id:0});
             // Presenter returns kOk only after waitUntilCompleted reports the
             // real command buffer completed. Errors never retire as success.
             const bool notSubmitted=result!=gpupresent::kOk && result!=gpupresent::kGpuFailed;
+            const bool gpuFailed=result==gpupresent::kGpuFailed;
             PongScanoutDone done{frame.sequence,result==gpupresent::kOk?0u:
                 (notSubmitted?uint32_t(PongScanoutNotSubmitted):0xe00002bcu),0};bytes=0;
             status=context->call(context->connection,PongScanoutComplete,&done,sizeof(done),nullptr,&bytes);
-            if(status || result==gpupresent::kGpuFailed) {
-                report("GPU scanout copy failed; mappings retained",status?:int(result));return nullptr;
+            if(status) {
+                // The kernel owns the frame until Complete; if it refuses the
+                // report there is nothing safe to retry.
+                report("scanout completion refused",status);return nullptr;
             }
+            if(gpuFailed) {
+                // The command buffer completed with an error; the DMA is
+                // retired, so drop this frame's imports and retry instead of
+                // leaving the display without a worker.
+                if(gpuFailures++<8 || !(gpuFailures&(gpuFailures-1)))
+                    report("GPU scanout copy failed; retrying with fresh imports",
+                        context->presenter->lastError()?:int(result));
+                context->presenter->resetSources();
+                size_t reset=0;
+                for(unsigned i=0;i<100;i++) {
+                    status=context->call(context->connection,PongScanoutResetSources,nullptr,0,nullptr,&reset);
+                    if(unsigned(status)!=0xe00002d5)break;
+                    usleep(1000);
+                }
+                usleep(gpuFailures<4?10000:(gpuFailures<8?50000:250000));
+                continue;
+            }
+            gpuFailures=0;
             if(notSubmitted) {
                 if(++refusals<=3 || !(refusals&(refusals-1)))
                     report("scanout copy not submitted; retire unused imports and retry",int(result));
