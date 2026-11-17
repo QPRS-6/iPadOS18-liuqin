@@ -86,7 +86,9 @@ def main():
     # startup entry or platform helper would otherwise be omitted at link.
     dependencies = {
         'XNU_PONG_WIFI': ('XNU_PONG_POWER', 'XNU_ARMCPU', 'XNU_NATIVE_UFS'),
-        'XNU_PONG_BACKLIGHT': ('XNU_PONG_POWER',),
+        # The KTZ8866 backlight is self-contained (GeniI2c only); it does not
+        # need the pong battery/audio power stack linked on liuqin.
+        'XNU_PONG_BACKLIGHT': (),
         'XNU_PONG_POWER': ('XNU_ARM_DT_PLATFORM', 'XNU_ARMCPU'),
         'XNU_ARM_DT_PLATFORM': ('XNU_ARMCPU',),
     }

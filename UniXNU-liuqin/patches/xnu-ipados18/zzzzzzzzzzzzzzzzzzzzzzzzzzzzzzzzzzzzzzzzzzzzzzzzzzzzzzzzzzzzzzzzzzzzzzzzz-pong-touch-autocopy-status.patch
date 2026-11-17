@@ -1,0 +1,37 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -3468,18 +3468,27 @@
+ 		}
+ 	}
+ 
+-	/* nvt_check_spi_dma_tx_info(): 200 tries, 1 ms apart, 0x00 means the
+-	 * copy engine has moved the image into ILM and DLM. */
++	/* NT36532 auto_copy=2 pairs the 0x56 command with polling
++	 * TX_AUTO_COPY_EN itself (vendor nvt_wait_auto_copy), not the
++	 * SPI_DMA_TX_INFO register used by auto_copy=1 / command 0x69. */
+ 	txinfo = 0xff;
+ 	for (polls = 0; polls < 200; polls++) {
+-		uint8_t info[2] = { 0 };
+-
+-		(void)tch_nvt_read(NVT_SPI_DMA_TX_INFO, info, sizeof(info));
+-		txinfo = info[0];
+-		if (txinfo == 0x00) {
++		uint8_t info = 0xff;
++		const int status = tch_nvt_read(NVT_TX_AUTO_COPY_EN, &info, sizeof(info));
++
++		txinfo = info;
++		if (status == 0 && txinfo == 0x00) {
+ 			break;
+ 		}
+ 		delay(1000);
++	}
++	printf("LIUQIN TOUCH: fw auto-copy mode=2 reg=%06x status=%02x polls=%u %s\n",
++	    NVT_TX_AUTO_COPY_EN, txinfo, polls, polls < 200 ? "complete" : "timeout");
++	if (polls == 200) {
++		/* Do not issue CRC/start commands after a failed copy prerequisite. */
++		tch.bb_pace_us = saved_pace;
++		tch_visible_mark("touch fw copy FAIL");
++		return -1;
+ 	}
+ 	/*
+ 	 * Full read-back of both sections: the BLD CRC registers report the last

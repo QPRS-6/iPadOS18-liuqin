@@ -11,7 +11,7 @@
 # Local build preference
 
 - The user explicitly requested skipping image hashes, image audits and device image readback verification. Use `--skip-image-verification` for kernel/boot builds and the default non-verifying Pong userland workflow. Do not run verification or benchmarks unless the user asks.
-- Keep generated candidates and runtime artifacts under `/Volumes/PongDev/build/servicesNN`, logs/install receipts under `/Volumes/PongDev/logs/pong/servicesNN`, and temporary task scripts under `/Volumes/PongDev/tmp/servicesNN`. Never write these into the user's Downloads directory.
+- Keep generated candidates and runtime artifacts under `/Volumes/share/build/servicesNN`, logs/install receipts under `/Volumes/share/logs/pong/servicesNN`, and temporary task scripts under `/Volumes/share/tmp/servicesNN`. Never write these into the user's Downloads directory.
 - The user requested deleting superseded temporary candidates and logs. Retain current deployment metadata and required compiler/firmware inputs; retire the previous candidate after the replacement is deployed. Keep original project sources and user scripts.
 - For system updates, the user requests changed parts only. Refresh the unmounted guest OS with `scripts/sync-pong-os-for-update.py` before local edits, then use begin/stage/finish and install changed bands. Keep REC quiescent until the update is installed so guest filesystem changes are preserved. Do not blindly overlay old host APFS metadata after a guest boot.
 - DarwinBoot24 and the selected XNU boot_args ABI have a 1024-byte command-line array, including the NUL terminator. Keep the assembled ASCII boot command at most 1023 bytes. Shorten optional log filters instead of changing the ABI or silently truncating functional boot arguments.
@@ -26,7 +26,22 @@
 - Keep XNU_PONG_POWER independent of Wi-Fi. Shared RPMh/SMMU locks belong to PongPlatformResources, and Darwin24 links native4K helpers once through libPongSmmu4K.a.
 - Native public prerequisites are pinned in configs/pong-native-sources.toml. Use scripts/fetch-pong-native-sources.py and ignored local.toml paths; do not reintroduce host volume paths into recipes.
 
-# From-zero build (this machine: liuqin / iPadOS 18.7.10 / 22H374)
+# From-zero build (liuqin / iPadOS 18.7.10 / 22H374)
+
+This repository carries **only our own code, patches and scripts**. Apple's
+sources (XNU, IOStorageFamily, libdispatch …), the IPSW extract, the SDK,
+firmware, OS images and every build artifact are local inputs and are
+git-ignored on purpose, so a fresh clone builds nothing until they exist.
+
+**Step 0 — always run the input check first:**
+
+```sh
+python3 scripts/check-inputs.py          # --json for agents, --quiet for CI
+```
+
+Every `MISS` line prints the path, its purpose and how to obtain it. The full
+table is `docs/INPUTS.zh.md`. Do not try to "fix" a missing input by editing
+recipes or by inventing a placeholder file.
 
 Read `docs/LAYOUT.zh.md` (directory map) and `docs/BUILD.zh.md` (full guide)
 before building. This section is the short, executable version.
@@ -40,13 +55,17 @@ export UNI=$LIUQIN/UniXNU
 export METAL=$HOME/liuqin-metal
 ```
 
-External inputs that are not produced by a build:
+External inputs that are not produced by a build (`docs/INPUTS.zh.md` has the
+complete list and how to obtain each one):
 
 - `iPadOS-liuqin` workspace (`shim/`, `tools/mkpayload.py`):
   `/Users/qprs/Documents/deepseek-harness/default-workspace/iPadOS-liuqin`
-- `ld.lld`: `/Users/qprs/liuqin-build3/ld.lld`
+- `ld.lld`: `/Users/qprs/liuqin-build3/ld.lld` (or `LLD=` in the environment)
 - IPSW extract + trustcache: `$LIUQIN/ipsw-22H374/`
 - SDK, MIG, Adreno firmware, `xnu-10063`, `xnu-8796`, `UniXNU-sheng`
+- OS/Data images: `$LIUQIN/userland-22H374/*.cdr`, `$LIUQIN/ufs-22H374/*`
+- third-party driver sources: `$DEVICE/refer/ipados18/{QcaBluetooth,Ath12kWifi,linux-7.0.14}`
+- historical build inputs under `/Volumes/share/build/services{49,67,80,97}`
 
 ## Build order
 

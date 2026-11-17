@@ -59,7 +59,8 @@ slide = "-0x1000000"
 roots = ["com.apple.kec.corecrypto", "com.apple.kec.pthread", "com.apple.filesystems.apfs",
          "com.apple.iokit.IOStorageFamily", "com.apple.kec.Compression",
          "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
-         "com.apple.iokit.IOGPUFamily"]
+         "com.apple.iokit.IOGPUFamily",
+         "com.apple.iokit.IOHIDFamily"]
 # The original IOAcceleratorES class code is needed by the Pong accelerator ABI.
 # Copy it and its dependencies as code-only: no prelink metadata, no kext start,
 # so Pong's native IOSurfaceRootUserClient remains the only class of that name.

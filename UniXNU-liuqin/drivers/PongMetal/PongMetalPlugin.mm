@@ -18,6 +18,7 @@
 #include "NativeBridgeMetalFrontend.h"
 #include "NativeAdrenoABI.h"
 #include "SharedShaderCache.h"
+#include "PongMetalAppDiagnostics.h"
 
 @interface _MTLDevice : NSObject
 @end
@@ -36,7 +37,8 @@ static void *iokit;
 }
 static void report(const char *phase,int status)
 {
-    char line[256];snprintf(line,sizeof(line),"Pong Metal: %s status=0x%x\n",phase,status);
+    char line[512];snprintf(line,sizeof(line),"Pong Metal: pid=%d process=%.48s %.360s status=0x%x\n",
+        getpid(),getprogname()?:"?",phase,status);
     (void)write(2,line,strlen(line));
     size_t count=CTL_MAXNAME;int mib[CTL_MAXNAME];
     if(!sysctlnametomib("kern.pong_diagnostic",mib,&count))
@@ -124,6 +126,10 @@ static bool backend(unsigned port,uint64_t *registryID)
 }
 static id openDevice(unsigned port)
 {
+    // Backend admission itself can fail (Freeform's57 startup). Install the
+    // explicitly requested diagnostic before admission, not after it.
+    {char args[1024]={};size_t size=sizeof args;
+     if(!sysctlbyname("kern.bootargs",args,&size,nullptr,0))pongmetaldiag::install(args);}
     uint64_t registryID=0;if(!backend(port,&registryID))return nil;
     // DYLD injection does not load the executable through NSBundle. Locate
     // its sibling with dladdr as upstream does, independent of bundle lookup.
@@ -288,4 +294,3 @@ static void startPresentation(id candidate,unsigned port)
     }
 }
 @end
-

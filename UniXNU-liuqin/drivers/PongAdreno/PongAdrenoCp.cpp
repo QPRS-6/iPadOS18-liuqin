@@ -3,6 +3,8 @@
 #include "../PongPower/PongPlatformResources.h"
 #include "PongAdrenoCpProfile.h"
 #include "PongAdrenoZap.h"
+#include "PongGpuVaPolicy.h"
+#include "../PongProbe.h"
 #include "submit/NativeAdrenoSmmuContext.h"
 #include "submit/NativeAdrenoCpInit.h"
 #include "submit/NativeAdrenoIrq.h"
@@ -41,7 +43,7 @@ constexpr unsigned gpu_stream_count=sizeof(gpu_sids)/sizeof(*gpu_sids);
 constexpr uint32_t SmmuContextFaultMask=0xc00001feu;
 struct Device {
     PongCpOps ops{};
-    NativeAdrenoMemory tables,buffers[5],metadata;
+    NativeAdrenoMemory tables,buffers[5],metadata,high_probe;
     NativeAdrenoSmmuContext context;
     NativeAdrenoVm vm;
     NativeAdrenoRing ring;
@@ -54,7 +56,8 @@ struct Device {
     PongCpBackend backend{};
     OSSharedPtr<IOMemoryMap> zap_map;
     PongZapState zap{};
-    unsigned output_bits=0;
+    unsigned output_bits=0,input_bits=32;
+    uint64_t va_bytes=UINT64_C(0x100000000),high_probe_handle=0;
     uint32_t alias_scratch[262144]{};
     bool prepared=false,started=false,poisoned=false,irq_attached=false;
 };
@@ -362,12 +365,12 @@ IOReturn PongAdrenoCpPrepare(const PongCpOps *ops)
         if(!sw(0xc00+slots[i]*4,0x20000) || !sw(0x800+slots[i]*4,(ex?0:0x80000000u)|gpu_sids[i]) ||
            !sw(0xc00+slots[i]*4,0x20000|(ex?1024:0)))return kIOReturnIOError;
     }
-    // Keep the previously working 32-bit IOVA aperture while recovering
-    // boot. The wider context was rejected by the software TBI policy;
-    // that failure did not establish a hardware address-width limitation.
-    // One L1 root, four L2 pages and 2048 L3 pages cover 4 GiB at 4 KiB.
-    IOReturn status=gpu->tables.allocate(2053*4096,gpu->output_bits,true,2053*4096);
-    if(!status)status=gpu->context.prepare(&gpu->tables,0,0,UINT64_C(0x100000000),1048576,0,2,4096,gpu->output_bits,32);
+    unsigned requested_va=32;PE_parse_boot_argn("gpuva",&requested_va,sizeof(requested_va));
+    const auto va=pongGpuVaPolicy(requested_va);
+    gpu->input_bits=va.bits;gpu->va_bytes=va.bytes;
+    note("GPU VA policy",0,va.bits,va.bytes);
+    IOReturn status=gpu->tables.allocate(va.table_pages*4096,gpu->output_bits,true,va.table_pages*4096);
+    if(!status)status=gpu->context.prepare(&gpu->tables,0,0,va.bytes,va.leaves,0,2,4096,gpu->output_bits,va.bits);
     if(!status)gpu->context.setAliasScratch(gpu->alias_scratch,262144);
     if(!status)status=gpu->context.program(&ops->smmu);
     ArmSmmu4KStream streams[gpu_stream_count]={};
@@ -384,6 +387,15 @@ IOReturn PongAdrenoCpPrepare(const PongCpOps *ops)
         status=gpu->buffers[i].allocate(sizes[i],gpu->output_bits,true,sizes[i]);uint64_t handle=0;
         if(!status)status=gpu->buffers[i].makeWriteCombined();
         if(!status)status=gpu->vm.map(&gpu->buffers[i],0,iovas[i],i?3:5,0,2,&handle);
+    }
+    if(gpu->input_bits==36) {
+        if(!status)status=gpu->high_probe.allocate(8192,gpu->output_bits,true,8192);
+        if(!status)status=gpu->high_probe.makeWriteCombined();
+        if(!status)status=gpu->vm.map(&gpu->high_probe,0,PongGpuHighProbeIova,3,0,2,&gpu->high_probe_handle);
+        if(status) {
+            PongProbeRecord(14,"gpu-wide-va",PongProbeSkip,"probe mapping unavailable",uint32_t(status));
+            note("GPU wide VA probe SKIP",uint32_t(status),PongGpuHighProbeIova);
+        }
     }
     if(!status && (PongAdrenoSqeFirmwareBytes<8 || PongAdrenoSqeFirmwareBytes-4>sizes[0]))status=kIOReturnBadArgument;
     if(!status) {
@@ -444,6 +456,34 @@ IOReturn PongAdrenoCpStart(PongGpuGmuDevice *gmu)
        !wait_fence(fence))return kIOReturnIOError;
     asm volatile("dsb sy":::"memory");
     if(scratch[0]!=write[3]){note("CP nonsecure write incomplete",1,scratch[0]);return kIOReturnIOError;}
+    if(gpu->input_bits==36) {
+        PongProbeRecord(14,"gpu-wide-va",PongProbeRunning,"CP high IB fetch/write",PongGpuHighProbeIova);
+        auto *probe=static_cast<uint32_t *>(gpu->high_probe.mapping());uint32_t launch[4]{};
+        if(!probe || !gpu->high_probe_handle || !pongGpuHighProbePackets(PongGpuHighProbeIova,probe,launch)) {
+            PongProbeRecord(14,"gpu-wide-va",PongProbeSkip,"probe prerequisite unavailable");
+            note("GPU wide VA probe SKIP",1);return kIOReturnNotReady;
+        }
+        probe[1024]=0;
+        IOReturn checked=gpu->high_probe.publishForDevice(0,8192,false);
+        asm volatile("dsb sy":::"memory");
+        if(!checked)checked=gpu->ring.submit(launch,4,&fence);
+        if(!checked && !wait_fence(fence))checked=kIOReturnTimeout;
+        if(!checked) {
+            // NativeAdrenoMemory maintains whole owned4KiB pages, even when
+            // the CP changed only one word. Keep its alignment contract.
+            checked=gpu->high_probe.acquireDeviceWrites(4096,4096);
+            note("GPU wide VA probe acquire",uint32_t(checked),4096,4096);
+        }
+        asm volatile("dsb sy":::"memory");
+        const uint32_t observed=static_cast<volatile uint32_t *>(gpu->high_probe.mapping())[1024];
+        if(!checked && observed!=PongGpuHighProbeValue)checked=kIOReturnIOError;
+        PongProbeRecord(14,"gpu-wide-va",checked?PongProbeFail:PongProbePass,
+            checked?"high-address fetch/write failed; retain resources":"high-address CP fetch/write confirmed",observed);
+        note(checked?"GPU wide VA probe FAIL":"GPU wide VA probe PASS",uint32_t(checked),PongGpuHighProbeIova,observed);
+        if(checked)return checked;
+        // The probe mapping remains owned in the reserved4GiB page, outside
+        // every user window. No uncertain DMA or page-table rollback occurs.
+    }
     status=gpu->irq.attach(&gpu->ops.registers);
     uint32_t route=0;uint64_t affinity=0;
     /* Pong DT: SPI 0x12c, level high; GIC architectural INTID is 300+32. */
@@ -462,8 +502,8 @@ IOReturn PongAdrenoCpStart(PongGpuGmuDevice *gmu)
     native_adreno_gpu_ticks=[]()->uint64_t{uint64_t value=0;if(gpu && !gpu->poisoned)(void)gpu->timer.read(&value);return value;};
     gpu->started=true;native_adreno_wc_enabled=1;
     gpu->backend={&gpu->vm,&gpu->submit,&gpu->ring,&gpu->timer,&gpu->status,{nullptr,now,idle},
-        {PongAdrenoChipId,PongAdrenoGmemBytes,0,0x1fffffffff000ULL,0x20000000,0xA0000000,
-         PongAdrenoHighestBankBit,6,1,4,NativeAdrenoDeviceClientIova,0},gpu->output_bits,client_healthy};
+         {PongAdrenoChipId,PongAdrenoGmemBytes,0,0x1fffffffff000ULL,0x20000000,gpu->input_bits==36?gpu->va_bytes-0x20000000:UINT64_C(0xA0000000),
+          PongAdrenoHighestBankBit,6,1,4,NativeAdrenoDeviceClientIova,0},gpu->output_bits,client_healthy,gpu->input_bits};
     note("CP ready; authenticated nonsecure fence",0,fence,ticks);
     return PongAdrenoPublishClient(&gpu->backend)?kIOReturnSuccess:kIOReturnNoResources;
 }

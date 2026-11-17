@@ -1,0 +1,40 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -75,6 +75,11 @@
+ #include <machine/reg.h>
+ #include <machine/psl.h>
+ #include <stdatomic.h>
++#if defined(__arm64__)
++#include <mach/arm/thread_status.h>
++/* Matched arm64 declaration; the definition stays in osfmk/arm64/status.c. */
++extern struct arm_saved_state *get_user_regs(struct thread *);
++#endif
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -1503,6 +1508,24 @@
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++#if defined(__arm64__)
++	/*
++	 * Owner110/111: a clean exit(1) leaves no crash report. Record only the
++	 * exiting bluetoothd image's user pc/lr plus the daemon restart helper's
++	 * reason/context registers. Bounded and name-gated.
++	 */
++	{
++		extern void pong_bt_exit_trace(const char *, int, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
++		if (rv != 0 && !strcmp(p->p_comm, "bluetoothd")) {
++			arm_saved_state_t *st = get_user_regs(self);
++			if (st != NULL) {
++				pong_bt_exit_trace(p->p_comm, rv, get_saved_state_pc(st), get_saved_state_lr(st),
++				    get_saved_state_reg(st, 19), get_saved_state_reg(st, 20), get_saved_state_reg(st, 31));
++			}
++		}
++	}
++#endif
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.

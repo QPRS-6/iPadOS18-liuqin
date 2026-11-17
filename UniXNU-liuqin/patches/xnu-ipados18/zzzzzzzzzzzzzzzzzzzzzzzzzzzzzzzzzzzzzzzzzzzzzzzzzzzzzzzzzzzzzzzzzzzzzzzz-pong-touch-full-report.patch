@@ -1,0 +1,60 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -336,6 +336,6 @@
+ #define NVT_MAX_FINGERS         10
+ #define NVT_POINT_LEN           65             /* event byte + 10 x 6 + 4 */
+ #define NVT_BUF_MAX             320      /* 256-byte verify reads + overhead */
+-/* The vendor's work function reads the event block with len = 109
+- * (one count byte plus 18 six-byte records). */
++/* Vendor CTP_SPI_READ length 109 includes the SPI address byte.
++ * Its 108-byte payload contains a touch prefix and an extension. */
+ #define NVT_EVENT_BLOCK_LEN     109
+@@ -2019,6 +2019,21 @@
+ 	return err;
+ }
+ 
++/* The liuqin vendor calls CTP_SPI_READ with 109 bytes including the
++ * address byte. Its helper clocks one extra dummy and copies length-1
++ * data bytes from RX+2: consume all 108 report bytes in ONE transaction.
++ * Only the existing 65-byte touch prefix is decoded; no stylus input is
++ * fabricated. A short prefix read does not match the vendor wire contract. */
++static int
++tch_read_report(uint8_t *frame)
++{
++	uint8_t report[NVT_EVENT_BLOCK_LEN - 1];
++	_Static_assert(sizeof(report) >= NVT_POINT_LEN, "report must contain the touch prefix");
++	const int err = tch_nvt_read(NVT_EVENT_BUF_ADDR, report, sizeof(report));
++	if (err == 0) memcpy(frame, report, NVT_POINT_LEN);
++	return err;
++}
++
+ /* gpio16..19 pad levels as a 4-bit mask (bit0 = gpio16).  A pad muxed to qup4
+  * still reports the pin level in TLMM GPIO_IN_OUT bit 0, which is the only way
+  * to see whether the engine's chip select actually reaches the panel. */
+@@ -4798,7 +4813,7 @@
+ 			uint8_t again[NVT_POINT_LEN] = { 0 };
+ 
+ 			delay(10 * 1000);
+-			if (tch_nvt_read(NVT_EVENT_BUF_ADDR, again, sizeof(again)) == 0 &&
++			if (tch_read_report(again) == 0 &&
+ 			    tch_frame_valid(again)) {
+ 				printf("LIUQIN TOUCH: a valid frame arrived after the "
+ 				    "0x51 ack, keeping the firmware running\n");
+@@ -4880,6 +4895,8 @@
+ 	memset(prevbuf, 0, sizeof(prevbuf));
+ 	printf("LIUQIN TOUCH: report thread up, %s\n",
+ 	    force_poll ? "event-buffer polling" : "INT on gpio21");
++	printf("LIUQIN TOUCH: full report payload=%u wire=%u prefix=%u one-read\n",
++	    (unsigned)(NVT_EVENT_BLOCK_LEN - 1), NVT_EVENT_BLOCK_LEN + tch.dummy, (unsigned)NVT_POINT_LEN);
+ 
+ 	for (;;) {
+ 		const int ticks = hz / 100 > 0 ? hz / 100 : 1;
+@@ -4991,7 +5008,7 @@
+ 		 */
+ 		/* Every attempt is counted so the heartbeat can say whether "no
+ 		 * frames" means a dead bus or a panel that simply is not sending. */
+-		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
++		if (tch_read_report(frame) != 0) {
+ 			tch_evt_errors++;
+ 			if (errors++ < 4) {
+ 				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",

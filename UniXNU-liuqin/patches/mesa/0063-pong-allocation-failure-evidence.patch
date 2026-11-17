@@ -1,0 +1,203 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -7,6 +7,7 @@
+ #include <errno.h>
+ 
+ #include <stdio.h>
++#include <stdarg.h>
+ #include <stdlib.h>
+ #include <pthread.h>
+ #include <string.h>
+@@ -57,6 +58,29 @@
+    NativeAdrenoAbiParams params;
+ } dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
+ 
++/* Bounded failure evidence, by stage, without logging successful BO traffic. */
++static bool
++darwin_log_failure(unsigned stage)
++{
++   static unsigned reports[5];
++   return stage < 5 && __atomic_fetch_add(&reports[stage], 1, __ATOMIC_RELAXED) < 16;
++}
++
++static VkResult darwin_device_lost(struct vk_device *device, const char *format, ...)
++   __attribute__((format(printf, 2, 3)));
++static VkResult
++darwin_device_lost(struct vk_device *device, const char *format, ...)
++{
++   char message[512];
++   va_list args;
++   va_start(args, format);
++   vsnprintf(message, sizeof(message), format, args);
++   va_end(args);
++   if (darwin_log_failure(4))
++      fprintf(stderr, "Pong Turnip device-lost: pid=%d %s\n", getpid(), message);
++   return vk_device_set_lost(device, "%s", message);
++}
++
+ /* Preserve the native handle, CPU view and IOVA until the captured ring fence
+  * actually completed. An unrelated later submission never extends this lease.
+  * The queue is bounded; pressure may wait, but ordinary destruction does not. */
+@@ -221,7 +245,7 @@
+       return VK_SUCCESS;
+    if (kr == kIOReturnTimeout)
+       return VK_TIMEOUT;
+-   return vk_device_set_lost(&dev->vk, "%s failed: 0x%x", what, kr);
++   return darwin_device_lost(&dev->vk, "%s failed: 0x%x", what, kr);
+ }
+ 
+ /* Waits for a fence in short kernel waits so the connection lock is never held for long. */
+@@ -303,7 +327,17 @@
+       dev->vma.alloc_high = false;
+       *iova = util_vma_heap_alloc(&dev->vma, size, os_page_size);
+    }
++   uint64_t available = 0, largest = 0;
++   if (!*iova) {
++      available = dev->vma.free_size;
++      largest = util_vma_heap_get_max_free_continuous_size(&dev->vma);
++   }
+    mtx_unlock(&dev->vma_mutex);
++   if (!*iova && darwin_log_failure(0))
++      fprintf(stderr, "Pong Turnip OOM: pid=%d stage=va request=%llu free=%llu largest=%llu start=0x%llx bytes=%llu\n",
++              getpid(), (unsigned long long)size, (unsigned long long)available,
++              (unsigned long long)largest, (unsigned long long)dev->va_start,
++              (unsigned long long)dev->va_size);
+    return *iova ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
+ 
+@@ -342,13 +376,13 @@
+             kern_return_t kr = IOConnectUnmapMemory64(dw.conn, bo->token, mach_task_self(),
+                                                      (mach_vm_address_t)(uintptr_t)bo->mapping);
+             if (kr != KERN_SUCCESS)
+-               return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
++               return retire->failure = darwin_device_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
+             bo->mapping = NULL;
+          }
+          NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->handle, .token = bo->token};
+          kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
+          if (kr != KERN_SUCCESS)
+-            return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU lease release failed: 0x%x", kr);
++            return retire->failure = darwin_device_lost(&dev->vk, "deferred CPU lease release failed: 0x%x", kr);
+          bo->token = 0;
+       }
+       NativeAdrenoAbiBoFree release = {.handle = bo->handle};
+@@ -356,7 +390,7 @@
+       if (kr == kIOReturnBusy)
+          return VK_SUCCESS;
+       if (kr != KERN_SUCCESS)
+-         return retire->failure = vk_device_set_lost(&dev->vk, "deferred BoFree failed: 0x%x", kr);
++         return retire->failure = darwin_device_lost(&dev->vk, "deferred BoFree failed: 0x%x", kr);
+       darwin_free_iova(dev, bo->iova, bo->size);
+       *bo = {};
+       retire->head = (retire->head + 1) % DARWIN_RETIRED_BOS;
+@@ -380,6 +414,10 @@
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+                    uint64_t size, kern_return_t map_error)
+ {
++   if (darwin_log_failure(3))
++      fprintf(stderr, "Pong Turnip failure: pid=%d stage=BoMap status=0x%x iova=0x%llx bytes=%llu start=0x%llx scope=%llu\n",
++              getpid(), map_error, (unsigned long long)iova, (unsigned long long)size,
++              (unsigned long long)dev->va_start, (unsigned long long)dev->va_size);
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+    kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {
+@@ -390,7 +428,7 @@
+     * reusing its IOVA, even though no tu_bo could be published to the caller. */
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+-   retire->failure = vk_device_set_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
++   retire->failure = darwin_device_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
+    VkResult result = retire->failure;
+    pthread_mutex_unlock(&retire->lock);
+    return result;
+@@ -423,6 +461,9 @@
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      if (darwin_log_failure(1))
++         fprintf(stderr, "Pong Turnip failure: pid=%d stage=BoAlloc status=0x%x bytes=%llu\n",
++                 getpid(), kr, (unsigned long long)size);
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+    }
+ 
+@@ -489,6 +530,9 @@
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      if (darwin_log_failure(2))
++         fprintf(stderr, "Pong Turnip failure: pid=%d stage=BoImport status=0x%x bytes=%llu\n",
++                 getpid(), kr, (unsigned long long)size);
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+    }
+    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+@@ -633,7 +677,7 @@
+       VkResult waited = darwin_wait_idle(dev);
+       pthread_mutex_lock(&retire->lock);
+       if (waited != VK_SUCCESS)
+-         retire->failure = vk_device_set_lost(&dev->vk, "deferred BO pressure wait failed");
++         retire->failure = darwin_device_lost(&dev->vk, "deferred BO pressure wait failed");
+       else
+          darwin_reap_locked(dev, retire);
+    }
+@@ -649,7 +693,7 @@
+    } else {
+       /* No reusable range is reported on error. The kernel still owns the handle
+        * and view; connection teardown must drain them, even if this record cannot fit. */
+-      retire->failure = vk_device_set_lost(&dev->vk, "deferred BO queue remains full; retaining native allocation");
++      retire->failure = darwin_device_lost(&dev->vk, "deferred BO queue remains full; retaining native allocation");
+    }
+    pthread_mutex_unlock(&retire->lock);
+ 
+@@ -910,7 +954,7 @@
+    NativeAdrenoAbiSubmitBatch req = {};
+    const bool batch = dw.params.flags & NativeAdrenoParamsSubmitBatch;
+    if (count > (batch ? NativeAdrenoAbiMaxBatchBuffers : NativeAdrenoAbiMaxBuffers))
+-      return vk_device_set_lost(&dev->vk, "submit: unsupported batch length");
++      return darwin_device_lost(&dev->vk, "submit: unsupported batch length");
+    req.buffer_count = count;
+    req.queue = 0;
+    for (unsigned i = 0; i < count; i++)
+@@ -925,7 +969,7 @@
+          return VK_SUCCESS;
+       }
+       if (kr != kIOReturnBusy)
+-         return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++         return darwin_device_lost(&dev->vk, "submit failed: 0x%x", kr);
+ 
+       pthread_mutex_lock(&dw.lock);
+       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+@@ -933,9 +977,9 @@
+       if (!oldest)
+          usleep(100);
+       else if (dw_wait_fence_locked_free(dev, oldest, os_time_get_nano() + 5000000000ull) != VK_SUCCESS)
+-         return vk_device_set_lost(&dev->vk, "submit: GPU did not retire a job");
+-   }
+-   return vk_device_set_lost(&dev->vk, "submit: no free job slot");
++         return darwin_device_lost(&dev->vk, "submit: GPU did not retire a job");
++   }
++   return darwin_device_lost(&dev->vk, "submit: no free job slot");
+ }
+ 
+ static VkResult
+@@ -952,7 +996,7 @@
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+-         return vk_device_set_lost(&dev->vk, "wait before submit failed");
++         return darwin_device_lost(&dev->vk, "wait before submit failed");
+    }
+ 
+    uint32_t fence = 0;
+@@ -1093,10 +1137,10 @@
+    if (kr == kIOReturnUnsupported)
+       return VK_SUCCESS; /* counters not attached in this kernel */
+    if (kr != KERN_SUCCESS)
+-      return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++      return darwin_device_lost(&device->vk, "error getting GPU status: 0x%x", kr);
+    if (reply.faults != device->fault_count) {
+       device->fault_count = reply.faults;
+-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
++      return darwin_device_lost(&device->vk, "GPU faulted or hung");
+    }
+    return VK_SUCCESS;
+ }

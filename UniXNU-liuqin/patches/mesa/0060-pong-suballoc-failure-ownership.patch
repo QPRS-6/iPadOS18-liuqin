@@ -1,0 +1,34 @@
+From: Pong liuqin integration
+Subject: [PATCH] turnip: clear released suballocator BO ownership
+
+Mapping failure releases the current BO; clear the pointer and cursor so a
+later allocation cannot dereference it. Preserve the actual transport error.
+Clear a returned suballocation after transferring or dropping its reference.
+
+--- a/src/freedreno/vulkan/tu_suballoc.cc
++++ b/src/freedreno/vulkan/tu_suballoc.cc
+@@ -92,7 +92,9 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
+    VkResult result = tu_bo_map(suballoc->dev, suballoc->bo, NULL);
+    if (result != VK_SUCCESS) {
+       tu_bo_finish(suballoc->dev, suballoc->bo);
+-      return VK_ERROR_OUT_OF_HOST_MEMORY;
++      suballoc->bo = NULL;
++      suballoc->next_offset = 0;
++      return result;
+    }
+ 
+    suballoc_bo->bo = tu_bo_get_ref(suballoc->bo);
+@@ -114,11 +116,13 @@ tu_suballoc_bo_free(struct tu_suballocator *suballoc, struct tu_suballoc_bo *bo)
+     */
+    if (p_atomic_read(&bo->bo->refcnt) == 1 && !suballoc->cached_bo) {
+       suballoc->cached_bo = bo->bo;
++      *bo = {};
+       return;
+    }
+ 
+    /* Otherwise, drop the refcount on it normally. */
+    tu_bo_finish(suballoc->dev, bo->bo);
++   *bo = {};
+ }
+ 
+ void *

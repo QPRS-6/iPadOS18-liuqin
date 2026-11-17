@@ -1,0 +1,55 @@
+From: PongPlatform24 <local>
+Subject: [PATCH] turnip: preserve the edges of linear host imports in GMEM
+
+The runtime's InPlaceWrites path aliases IOSurface-owned rows. The ordinary
+image-edge exception assumes driver-owned padding, which those rows do not
+provide. Port the companion import-edge decision to the current Mesa tree;
+keep its existing exact-texel blits, format/swap calculations and CCU layout.
+
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5561,6 +5561,26 @@
+    tu_cs_emit_qw(cs, global_iova(cmd, dbg_one));
+ }
+ 
++/* A linear image over host memory or an explicit layout has only its owner's
++ * rows. At an unaligned edge the blit event rounds to whole GMEM blocks; the
++ * normal image-edge exception in tu_attachment_store_unaligned assumes padding
++ * that this owner did not grant. Use the existing exact-texel load/store paths.
++ * This also feeds tu_choose_gmem_layout, reserving CCU space for those stores.
++ */
++static bool
++tu_attachment_unpadded(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview)
++{
++   const struct fd_dev_info *info = cmd->device->physical_device->info;
++   const VkExternalMemoryHandleTypeFlags host_types =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
++   return iview->image->layout[0].tile_mode == TILE6_LINEAR &&
++          (iview->image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
++           (iview->image->vk.external_handle_types & host_types)) &&
++          (iview->view.width % info->gmem_align_w ||
++           iview->view.height % info->gmem_align_h);
++}
++
+ template <chip CHIP>
+ void
+ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
+@@ -5599,6 +5619,7 @@
+ 
+    if (TU_DEBUG(3D_LOAD) ||
+        cmd->state.pass->has_fdm ||
++       tu_attachment_unpadded(cmd, iview) ||
+        /* Replicating unresolve seems to not work and the blob never uses it.
+         */
+        (a != gmem_a)) {
+@@ -5810,6 +5831,9 @@
+    if (TU_DEBUG(UNALIGNED_STORE))
+       return true;
+ 
++   if (tu_attachment_unpadded(cmd, iview))
++      return true;
++
+    unsigned render_area_count =
+       cmd->state.per_layer_render_area ? cmd->state.pass->num_views : 1;
+ 

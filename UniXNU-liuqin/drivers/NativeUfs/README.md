@@ -23,6 +23,16 @@ Pong 专属实现，上游没有对应组件（`UniXNU/ShengUfs` 是 SM8550 的�
 
 ### 文件
 
+### 有界持久日志
+
+控制台日志写入根布局之外的4MiB分区尾部区域，5秒快照间隔不变。
+默认最多240次成功快照（约20分钟）；显式诊断参数
+`pong_log_flushes=720` 可延长到约一小时，但仍保持有限写入预算。
+零值或超出720的请求回到默认值。未变化的快照、失败写入不消耗预算；
+UFS未就绪/不可写/poisoned时不发写入。不改变APFS窗口或传输/SMMU策略。
+`tests/pong-log-budget.py` 对实际flush函数注入记录型写入，测试默认/扩展上限、
+错误与未变化快照、最终停止和poisoned拒绝。主机测试不是设备日志写盘证明。
+
 - `NativeUfs.cpp`：`IOService` 前端。映射 GCC UFS 页与 host 寄存器窗口，取得 SMMU stream ID `0xe0`，注册 UFS 中断，然后交给传输层。
 - `PongUfsTransport.cpp`：`pong_ufs_transport_start` 的板级实现，负责时钟、PHY 与设备初始化序列。
 - `RootLayout.h`：userdata 里 SHNGROOT v1 的解析器，包含 LUN 0 GPT 与根镜像清单，强制 OS / SystemOS / Data 三窗口。

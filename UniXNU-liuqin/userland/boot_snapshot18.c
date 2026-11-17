@@ -73,6 +73,16 @@ static void snapshot(int fd,unsigned elapsed)
 static void *worker(void *unused)
 {
     (void)unused;
+    if(!strcmp(process_name,"InputUI")) {
+        // On-demand InputUI starts when the password field is focused.
+        // Capture two finite self-task snapshots directly in PONGLOG; do not
+        // suspend threads or read input text. Other startup snapshots stay as-is.
+        int console=dup(STDERR_FILENO);
+        if(console<0)return NULL;
+        sleep(2);snapshot(console,2);
+        sleep(8);snapshot(console,10);
+        close(console);return NULL;
+    }
     char path[256];
     snprintf(path,sizeof(path),"%s/PongBoot-%s.txt",
         geteuid()==0?"/private/var/logs":"/private/var/mobile/Library/Logs",process_name);
@@ -90,7 +100,7 @@ void pong_boot_snapshot_start(const char *name)
 {
     if(strcmp(name,"SpringBoard") && strcmp(name,"backboardd") && strcmp(name,"lsd") &&
        strcmp(name,"containermanagerd") && strcmp(name,"containermanagerd_system") &&
-       strcmp(name,"runningboardd") && strcmp(name,"PosterBoard") && strcmp(name,"wifid"))return;
+        strcmp(name,"runningboardd") && strcmp(name,"PosterBoard") && strcmp(name,"wifid") && strcmp(name,"InputUI"))return;
     process_name=name;
     pthread_attr_t attr;
     if(pthread_attr_init(&attr))return;

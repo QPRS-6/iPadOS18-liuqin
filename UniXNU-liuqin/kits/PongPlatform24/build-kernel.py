@@ -150,7 +150,7 @@ def main():
                '--hardware-dtb', str(dtb), '--jobs', str(args.jobs)]
     # The resolved configuration `release` wrote at its preflight step: the tree
     # of a configuration lives in that configuration's own directory.
-    config = args.config_path or (shared.parent / '.config' if shared else None)
+    config = args.config_path or os.environ.get('PONG_CONFIG_PATH') or (shared.parent / '.config' if shared else None)
     if config and Path(config).is_file():
         command += ['--config-path', str(Path(config).resolve())]
     elif shared:

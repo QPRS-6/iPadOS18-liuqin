@@ -166,35 +166,54 @@ shasum -a 256 "$LIUQIN/shim-boot-pong.img"
 
 ### 5.1 bridge（`PongMetalBridge.dylib`）
 
-`scripts/build-pong-metal-bridge.py` 依赖上游 `metal_level.rs`，在 22H374 树上会失败。用等价的手动流程：
+`scripts/build-pong-metal-bridge.py` 识别已准备的 22H374 树中的 `.pong-parity.json`，
+直接使用该源码，避免向新布局套用旧 `metal_level.rs` 补丁。它从设备仓库当前
+`drivers/PongMetal/bridge/lib.rs` 构建，不再依赖可能过期的 `pong-runtime-source` 副本。
+编译器需要 Rust 1.98+，`llvm-as` 用于项目自有的 scanout shader。
+
+已准备的22H374树也需要 `0066-pong-scoped-memory-pressure.patch`；构建器自动应用，
+并将其列入 `build-report.json` 的 `local_runtime_patches`。它迁入按GPU实际堆限制
+扩池、同堆空闲块回收和OOM后的实际大小回退，保留原 `.pong-parity.json` 来源标识。
+该树是本机源码快照，没有Git目录；设备仓库中的可重放补丁记录新增变化。
 
 ```sh
-BR=$LIUQIN/metal18-bridge
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-
-xcrun clang++ -target arm64-apple-ios18.0 -isysroot "$SDK" \
-  -DPONG_GUEST_22H374=1 -std=c++17 -fobjc-arc -fblocks -O3 \
-  -Wall -Wextra -Werror -Wno-deprecated-declarations \
-  -I"$DEVICE/drivers/PongMetal" \
-  -c "$DEVICE/drivers/PongMetal/NativeBridgeMetalFrontend.mm" \
-  -o "$BR/PongMetalFrontend.o"
-
-"$LIUQIN/cargo/bin/cargo" build --release \
-  --manifest-path "$BR/Cargo.toml" --target aarch64-apple-ios \
-  --target-dir "$BR/target" --features ipados18
-
-xcrun clang++ -target arm64-apple-ios18.0 -isysroot "$SDK" -dynamiclib \
-  -Wl,-install_name,@rpath/PongMetalBridge.dylib \
-  "$BR/PongMetalFrontend.o" \
-  -Wl,-force_load,"$BR/target/aarch64-apple-ios/release/libpong_metal_bridge.a" \
-  -framework Foundation -framework Metal -framework IOSurface \
-  -framework QuartzCore -framework CoreGraphics -liconv -lresolv \
-  -o "$BR/PongMetalBridge.dylib"
+export METAL=$HOME/liuqin-metal
+BR=/path/to/new/metal-bridge
+CARGO_HOME="$METAL/cargo" RUSTUP_HOME="$METAL/rustup" \
+PONG_LLVM_AS="$METAL/bin/llvm-as" \
+python3 "$DEVICE/scripts/build-pong-metal-bridge.py" \
+  --guest-build 22H374 --translator "$METAL/metal2vulkan-22H374" \
+  --cargo "$METAL/cargo/bin/cargo" \
+  --target-dir "$METAL/new-seeded-target" --output-dir "$BR"
 ```
 
-`$BR/Cargo.toml` 里的 `path` 是绝对路径（frontend 的 `lib.rs` 与 `metal2vulkan` 工作树），按自己的目录改。
+新 Cargo target 用翻译器的 `scripts/seed-target` 从现有缓存克隆；复用原 `Cargo.lock`
+可保留依赖版本。缓存留在本地 APFS，避免占用 share。命令和实际源码路径写入
+`build-report.json`。services57 的完整构建入口是 `share/tmp/services57/build-metal57.py`；
+最终 error-encoder C++ 修正由同目录 `finalize-metal57.py` 复编并重链，使用已构建的相同 Rust ABI。
 
 ### 5.2 Turnip（`libvulkan_freedreno.dylib`）
+
+交叉编译的 iOS target/SDK 只放在 cross file 的编译参数中。不要向 Meson 的
+native/build-machine 检查程序传递全局 `IPHONEOS_DEPLOYMENT_TARGET` 或 iOS `SDKROOT`，
+否则它们会被错误链接为 iOS 可执行文件并在 macOS 上启动失败。构建器已隔离这些变量；
+`tests/turnip-build-env.py` 检查实际环境逻辑并编译/运行原生 macOS sanity 程序。
+
+22H374 构建器还应用 `0062-pong-active-device-lease.patch` 与
+`0063-pong-allocation-failure-evidence.patch`：设备 VMA 使用正式建连的实际租约，
+并记录有界的 VA/BO/DeviceLost 原因。补丁基于已准备的 Pong Mesa26.2.6 工作树。
+回归入口为 `tests/turnip-current-lease.py --mesa <tree> --output-dir <logs>`。
+
+services63 起，22H374 构建器接入设备仓库的 `drivers/PongAdreno/turnip/`
+重写后端。旧补丁仅用于准备旧工作树；实际后端由
+`scripts/stage-pong-turnip-backend.py` 安装，0064补丁连接Mesa字段/编译列表及
+队列错误清理。修改后端应编辑设备仓库源码，staging会保留并提示冲突的直接Mesa修改。
+新的回归入口为 `tests/turnip-backend-core.py` 和 `tests/turnip-backend-adapter.py`。
+
+services66的22H374构建另应用 `0066-pong-imported-gmem-edges.patch`，适配原位写入的
+紧凑线性导入图像边缘，保留现有格式/采样运算。回归入口
+`tests/turnip-imported-gmem.py --mesa <tree> --output-dir <logs>` 执行实际
+load/store/layout决策，不执行GPU像素。
 
 Mesa 和构建目录在**另一个工作区**（本文用 `METAL=$HOME/liuqin-metal`）：
 
@@ -240,7 +259,7 @@ bundle 里包含 `PongAdrenoMetal`、`PongMetalBridge.dylib`、
 
 ## 6. 更新 root 镜像
 
-插件在 `/System/Library/Extensions/PongAdrenoMetal.bundle`，必须写进 OS 窗口（需要 root）。
+插件在 `/System/Library/Extensions/PongAdrenoMetal.bundle`，必须写进 OS 窗口；首次创建目录需要 root。
 `refresh_metal` 同时把 `com.apple.cameracaptured` 的 `InactiveHardMemoryLimit` 从 27 MB 改成 -1：
 iOS 18 把客户端所有 Metal 工作放在 cameracaptured 里，27 MB 会让它启动约半秒就被 jetsam 杀掉并无限重启。
 
@@ -249,6 +268,12 @@ sudo "$LIUQIN/venv/bin/python" "$DEVICE/userland/build-ipados18.py" refresh_meta
   --out "$LIUQIN/userland-22H374" \
   --runtime "$LIUQIN/metal18-plugin-gmem"
 ```
+
+已有插件目录时，也可在**独立克隆的 prepared OS cdr** 上使用
+`refresh_metal --preserve-ownership`。该模式要求目标文件已经存在，原地写入并保留
+guest inode 的所有者、权限和 flags；不会以当前用户重建目录。它识别 SMB 的真实
+AppleDouble 元数据文件并跳过，仍执行 cameracaptured 的 jetsam 修正。
+services57 从 queue29 的本地 OS 克隆更新 Metal，使用用户已选择的全量 simg 工作流。
 
 然后重建 32 GiB 的 Android sparse 镜像：
 

@@ -116,6 +116,8 @@ bool nmb_texture_get_bytes(const NmbTexture *, void *bytes, uint64_t bytes_per_r
 NmbLibrary *nmb_library_new(NmbDevice *, const void *bytes, size_t length, bool air);
 void nmb_library_release(NmbLibrary *);
 uint32_t nmb_library_function_count(const NmbLibrary *);
+uint32_t nmb_library_extern_count(const NmbLibrary *);
+size_t nmb_library_extern_name(const NmbLibrary *, uint32_t index, char *out, size_t size);
 size_t nmb_library_function_name(const NmbLibrary *, uint32_t index, char *out, size_t size);
 NmbFunction *nmb_function_new(NmbLibrary *, const char *name);
 /* A function specialized with constant values (newFunctionWithName:constantValues:error:): type is Metal's MTLDataType, name is null for an
@@ -226,7 +228,7 @@ NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
 NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
 struct NmbPassAttachment {
     NmbTexture *texture;
-    uint64_t level, slice, depth_plane, load, store;
+    uint64_t level, slice, depth_plane, load, store, store_options;
     double clear[4]; /* color, or clear[0] depth / stencil */
     NmbTexture *resolve_texture;
     uint64_t resolve_level,resolve_slice,resolve_depth_plane,resolve_filter;
@@ -259,6 +261,12 @@ bool nmb_compute_set_threadgroup_memory(NmbEncoder *, uint32_t length, uint32_t 
 bool nmb_compute_dispatch(NmbEncoder *, const uint64_t size[3], const uint64_t per_group[3], bool threads);
 
 bool nmb_render_set_pipeline(NmbEncoder *, NmbRenderPipeline *);
+bool nmb_render_set_color_store_action(NmbEncoder *, uint64_t action, uint32_t index);
+bool nmb_render_set_depth_store_action(NmbEncoder *, uint64_t action);
+bool nmb_render_set_stencil_store_action(NmbEncoder *, uint64_t action);
+bool nmb_render_set_color_store_action_options(NmbEncoder *, uint64_t options, uint32_t index);
+bool nmb_render_set_depth_store_action_options(NmbEncoder *, uint64_t options);
+bool nmb_render_set_stencil_store_action_options(NmbEncoder *, uint64_t options);
 bool nmb_render_set_depth_stencil(NmbEncoder *, NmbDepthStencil *);
 bool nmb_render_set_viewport(NmbEncoder *, const double viewport[6]);
 bool nmb_render_set_scissor(NmbEncoder *, const uint64_t rect[4]);
@@ -277,8 +285,16 @@ bool nmb_blit_copy_buffer(NmbEncoder *, NmbBuffer *source, uint64_t source_offse
 bool nmb_blit_fill_buffer(NmbEncoder *, NmbBuffer *, uint64_t start, uint64_t end, uint8_t value);
 /* origins and sizes are x,y,z / width,height,depth */
 bool nmb_blit_copy_texture(NmbEncoder *, NmbTexture *source, uint64_t source_slice, uint64_t source_level, const uint64_t source_origin[3],
-                           const uint64_t size[3], NmbTexture *destination, uint64_t destination_slice, uint64_t destination_level,
-                           const uint64_t destination_origin[3]);
+                            const uint64_t size[3], NmbTexture *destination, uint64_t destination_slice, uint64_t destination_level,
+                            const uint64_t destination_origin[3]);
+/* One single-sample attachment copy. aspect: 0 color, 1 depth, 2 stencil.
+ * An aspect copy leaves the other aspect of a combined format untouched. */
+struct NmbAttachmentCopy {
+    NmbTexture *source, *destination;
+    uint64_t source_level, source_slice, destination_level, destination_slice;
+    uint64_t source_origin[3], destination_origin[3], size[3], aspect;
+};
+bool nmb_blit_copy_attachment(NmbEncoder *, const struct NmbAttachmentCopy *);
 bool nmb_blit_buffer_to_texture(NmbEncoder *, NmbBuffer *source, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image,
                                 const uint64_t size[3], NmbTexture *destination, uint64_t slice, uint64_t level, const uint64_t origin[3]);
 bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice, uint64_t level, const uint64_t origin[3],
@@ -304,5 +320,12 @@ uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
 #ifdef __cplusplus
 }
+static_assert(sizeof(NmbPassAttachment)==128,"render attachment C/Rust ABI");
+static_assert(offsetof(NmbPassAttachment,store_options)==48 && offsetof(NmbPassAttachment,clear)==56 &&
+              offsetof(NmbPassAttachment,resolve_texture)==88,"render attachment field ABI");
+static_assert(sizeof(NmbRenderPassDescriptor)==1320,"render pass C/Rust ABI");
+static_assert(sizeof(NmbAttachmentCopy)==128,"attachment copy C/Rust ABI");
+static_assert(offsetof(NmbAttachmentCopy,source_origin)==48 && offsetof(NmbAttachmentCopy,size)==96 &&
+              offsetof(NmbAttachmentCopy,aspect)==120,"attachment copy field ABI");
 #endif
 #endif

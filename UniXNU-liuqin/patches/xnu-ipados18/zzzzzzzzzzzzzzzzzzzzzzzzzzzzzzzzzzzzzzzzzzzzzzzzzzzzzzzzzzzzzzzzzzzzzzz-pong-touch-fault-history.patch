@@ -1,0 +1,70 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -4660,6 +4660,42 @@
+  * registers that prove the bus still answers. */
+ static unsigned tch_int_dumps;
+ 
++/* The liuqin vendor module records these two 64-byte histories before a
++ * watchdog reload (nvt_ts_work_func, mmap+0x74/+0x78). Read only, at most
++ * eight captures per boot; do not guess a meaning for the raw event codes. */
++static void
++tch_fault_history(const char *why)
++{
++	static unsigned captures;
++	static const uint32_t history[] = { 0x121afcu, 0x121b3cu };
++	uint8_t state = 0xff, crc = 0xff;
++	unsigned seen = __atomic_load_n(&captures, __ATOMIC_RELAXED);
++	do {
++		if (seen >= 8) return;
++	} while (!__atomic_compare_exchange_n(&captures, &seen, seen + 1, true,
++	    __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++	const unsigned capture = seen + 1;
++	(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &state, 1);
++	(void)tch_nvt_read(NVT_CRC_ERR_FLAG, &crc, 1);
++	printf("LIUQIN TOUCH: fault %u %s time_ms=%u gpio21=%d state=%02x crc_latch=%02x contacts=%u\n",
++	    capture, why, tch_ms_since(0), bb_get(21), state, crc, tch_valid_frames);
++	for (unsigned bank = 0; bank < 2; bank++) {
++		uint8_t bytes[64] = { 0 };
++		if (tch_nvt_read(history[bank], bytes, sizeof(bytes)) != 0) {
++			printf("LIUQIN TOUCH: history %u bank%u addr=%06x read failed\n",
++			    capture, bank, history[bank]);
++			continue;
++		}
++		for (unsigned at = 0; at < sizeof(bytes); at += 16) {
++			char line[64]; int used = 0;
++			for (unsigned i = 0; i < 16; i++)
++				used += snprintf(line + used, sizeof(line) - used, " %02x", bytes[at + i]);
++			printf("LIUQIN TOUCH: history %u bank%u addr=%06x +%02x:%s\n",
++			    capture, bank, history[bank], at, line);
++		}
++	}
++}
++
+ static void
+ tch_dump_event_page(unsigned n)
+ {
+@@ -4745,6 +4781,7 @@
+ 	}
+ 	if (++tch_hang_hits >= 10) {
+ 		tch_hang_hits = 0;
++		tch_fault_history("watchdog-before-ack");
+ 		/*
+ 		 * touch175: before paying for a whole re-download, give the firmware
+ 		 * the one thing the vendor gives it after boot - the host-alive write
+@@ -4769,7 +4806,7 @@
+ 			}
+ 		}
+ 		printf("LIUQIN TOUCH: ten watchdog interrupts with 0xFD/0xFE: the "
+-		    "firmware is stuck (vendor's CRC-fail loop pattern), %u valid "
++		    "controller watchdog report (cause not yet decoded), %u valid "
+ 		    "frames so far\n", tch_valid_frames);
+ 		tch_fw_dead = 1;
+ 	}
+@@ -5320,6 +5357,7 @@
+ 				/* A previously confirmed watchdog fault has not recovered.
+ 				 * No new IRQ is required; ordinary idle alone never enters here. */
++				tch_fault_history("watchdog-retry");
+ 				printf("LIUQIN TOUCH: recovery unconfirmed: FD/FE persists after attempt %u; retrying\n",
+ 				    recovery_attempts);
+ 				tch_fw_dead = 1;
+ 			}

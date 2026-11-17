@@ -25,3 +25,11 @@ git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
 ref = "IOStorageFamily-323"
 commit = "1b96f8f04b9dff4dc0277ac43625bf694e62c5aa"
 required = ["IOBlockStorageDevice.cpp", "IOBlockStorageDevice.h"]
+
+# Hardware-independent native UART.SK pipe only; no SM8550 GENI/firmware
+# initialization or iPadOS27 userspace patches are imported for liuqin.
+[[source]]
+input = "bluetooth_shared"
+git = "https://github.com/UniXNU/QcaBluetooth.git"
+commit = "986d6319d1d2819b27ed2c9786776f10bf63cc76"
+required = ["include/qbt_transport.h", "src/qbt_transport.c", "src/qbt_transport.c.license"]

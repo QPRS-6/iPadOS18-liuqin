@@ -69,7 +69,7 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
     // or VA lease. Real fence observation/BO reference retirement stay per job.
     const unsigned context=job.queue/NativeAdrenoAbiMaxQueues;
     const uint32_t completed=ring_->completedFence();
-    AcquiredWindow *acquired=context<16?&acquired_[context]:nullptr;
+    AcquiredWindow *acquired=context<NativeAdrenoAbiMaxClientScopes?&acquired_[context]:nullptr;
     if(!acquired || !acquired->valid || acquired->completed!=completed ||
        acquired->start!=job.window_start || acquired->bytes!=job.window_bytes) {
         if(vm_->acquireImported(job.window_start,job.window_bytes))return poison();
@@ -174,7 +174,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(client_pending>=cap){++admission_yields_;return kIOReturnBusy;}
     const uint64_t began=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const unsigned cache_context=queue/NativeAdrenoAbiMaxQueues;
-    if(cache_context<16)acquired_[cache_context].valid=false;
+    if(cache_context<NativeAdrenoAbiMaxClientScopes)acquired_[cache_context].valid=false;
     Job *job=free();
     if(!job)return kIOReturnBusy;
     for(size_t i=0;i<handle_count;++i) {

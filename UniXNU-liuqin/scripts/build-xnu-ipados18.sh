@@ -26,12 +26,12 @@ if wifi:
             'refusing XNU_PONG_WIFI=1 before compile: Linux ath11k pci.c is not at '
             f'{pci}. Set PONG_WIFI_SOURCE to a real Linux tree such as v7.0.14. '
             'No stub driver was written.')
-    sheng = pong_paths.sheng_root()
+    sheng = Path(os.environ['PONG_WIFI_SHARED']) if os.environ.get('PONG_WIFI_SHARED') else pong_paths.sheng_root() / 'drivers/Ath12kWifi'
     for rel in ('drivers/Ath12kWifi/include/nw_abi.h',
                 'drivers/Ath12kWifi/shim/src/lx_rt.c',
                 'drivers/Ath12kWifi/src/nw_sta.c',
                 'drivers/Ath12kWifi/src/nw_mac80211.c'):
-        path = sheng / rel
+        path = sheng / rel.removeprefix('drivers/Ath12kWifi/')
         if not path.is_file():
             raise SystemExit(
                 'refusing XNU_PONG_WIFI=1 before compile: UniXNU-sheng is missing '
@@ -265,6 +265,7 @@ if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
   WIFI_BUILD=${PONG_WIFI_BUILD:-/Volumes/Untitled/Pong-iPadOS18/wifi-ath11k-build}
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-ath11k.py" \
     --linux "$WIFI_SOURCE" \
+    --shared "${PONG_WIFI_SHARED:-$PONG_SHENG_ROOT/drivers/Ath12kWifi}" \
     --output-dir "$WIFI_BUILD"
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT" \
     --ath11k "$WIFI_BUILD/libPongAth11k.a"
@@ -963,6 +964,10 @@ if [ "$PONG_ADRENO_PLATFORM" = 1 ]; then
     --guest-build 22H374 --tree "$ROOT" --output-dir "$ROOT/build/pong-adreno"
   test -f "$ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
 fi
+if [ "${PONG_NATIVE_INPUT:-0}" = 1 ]; then
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-input-native.py" \
+    --tree "$ROOT" --output-dir "$ROOT/build/pong-input-native"
+fi
 if [ "$ARM_DT_PLATFORM" = 1 ] && [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; then
   ARM_DT_ARCHIVE=$ROOT/build/armdt-platform/libArmDTPlatform.a
   test -f "$ARM_DT_ARCHIVE"
@@ -1001,6 +1006,12 @@ PY_RAM_BLOCK_BINDINGS
   if [ "$PONG_ADRENO_PLATFORM" = 1 ]; then
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
+  fi
+  if [ "${PONG_NATIVE_INPUT:-0}" = 1 ]; then
+    INPUT_ARCHIVE=$ROOT/build/pong-input-native/libPongInputNative.a
+    test -f "$INPUT_ARCHIVE"
+    PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$INPUT_ARCHIVE"
+    PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $INPUT_ARCHIVE"
   fi
   if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ]; then
     POWER_ARCHIVE=$ROOT/build/pong-power/libPongPower.a
@@ -1062,7 +1073,7 @@ if [ -d "$PONG_IOKIT_OBJ" ]; then
   printf '%s\n' "$PONG_BACKLIGHT" > "$PONG_IOKIT_OBJ/.pong-backlight-mode"
 fi
 EXTRA_MAKE_ARGS+=("MiniIOMobileFramebuffer.cpo_CFLAGS_ADD=-DXNU_PONG_BACKLIGHT=$PONG_BACKLIGHT")
-EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS -DXNU_PONG_ADRENO_PLATFORM=$PONG_ADRENO_PLATFORM"
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS -DXNU_PONG_ADRENO_PLATFORM=$PONG_ADRENO_PLATFORM -DKERNEL_STACK_MULTIPLIER=2"
 # Darwin 24 consumes RC_NONARCH_CFLAGS through OTHER_CFLAGS in both CFLAGS
 # and SFLAGS. CFLAGS_EXTRA is not read by its makefiles: passing that name
 # silently omitted PAN/uaccess policy from C, C++ and assembly alike.

@@ -106,9 +106,10 @@ def main():
     # Sheng's late accelerator class: bind the selected guest's IOAcceleratorES
     # ancestry, and defer its constructor until IOGPUFamily is loaded.
     abi=json.loads((ROOT/('configs/pong-iogpu-'+a.guest_build+'.json')).read_text())
-    fixed=json.loads((ROOT/'mac-build/native-ufs/bindings.json').read_text())
-    if fixed.get('build', '20G81') != a.guest_build:raise RuntimeError('GPU and storage prelink guests differ')
-    slide=int(fixed['fixed_prelink_base'],16)-int(abi['original_prelink_base'],16)
+    import tomllib
+    board=tomllib.loads((ROOT/'board.toml').read_text())
+    if board['ipsw']['build']!=a.guest_build:raise RuntimeError('GPU and board guests differ')
+    slide=int(board['kernel']['prelink']['slide'],0)
     bindings={'__ZN15IOAcceleratorESC2EPK11OSMetaClass':'constructor',
               '__ZN15IOAcceleratorESD2Ev':'destructor',
               '__ZN15IOAcceleratorES10gMetaClassE':'metaclass',

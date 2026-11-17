@@ -224,6 +224,15 @@ class PongBattery : public IOPMPowerSource {
         native_battery_stats[8] = (int32_t)(bm.timeouts | bm.errors << 16);
         native_battery_stats[9] = (int32_t)bm.notifications;
         native_battery_stats[14] = (native_battery_stats[14] & 0xffff) | (int32_t)(bm.ignored << 16);
+#if PONG_BATTERY_LIUQIN
+        static uint32_t reportedCycle = ~0u;
+        if (bm.cycles_done != reportedCycle && (bm.cycles_done < 2 || bm.cycles_done % 6 == 0)) {
+            reportedCycle = bm.cycles_done;
+            IOLog("PongBattery: cycle=%u valid=%#x SOCraw=%d tempRaw=%d currentRaw=%d answers=%u timeouts=%u errors=%u\n",
+                bm.cycles_done, bm.valid, bm.value[BmCapacity], bm.value[BmTemperature],
+                bm.value[BmCurrent], bm.responses, bm.timeouts, bm.errors);
+        }
+#endif
     }
     void handle(int result) {
         if (result == BmCycleDone) publish();
@@ -236,6 +245,7 @@ class PongBattery : public IOPMPowerSource {
         if (!self) return;
         if (__atomic_exchange_n(&self->channelChanged, 0u, __ATOMIC_ACQ_REL)) {
             const bool up = __atomic_load_n(&self->channelUp, __ATOMIC_ACQUIRE) != 0;
+            if (up != self->wasUp) IOLog("PongBattery: PMIC GLINK channel %s\n", up ? "up" : "down");
             if (up && !self->wasUp) {
                 self->setProperty("PongBatteryStale", true);
                 native_battery_stats[0] = self->published ? 4 : 3;

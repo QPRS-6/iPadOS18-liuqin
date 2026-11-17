@@ -1,0 +1,243 @@
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -157,10 +157,11 @@
+ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+ /*
+  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
+- * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
+- * to 10 (the phone, 15 October; fb_threads=1 is how it was).
++ * drawRows()). One by default; opt in to parallel rows with fb_threads=3.
++ * fb_mid=1 additionally binds those three workers to observed Cortex-A710s.
+  */
+ static TUNABLE(uint32_t, gThreads, "fb_threads", 1);
++extern "C" void pong_fb_worker_prepare(unsigned worker, unsigned workers);
+ #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+ static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+ static inline unsigned
+@@ -913,7 +914,7 @@
+ 	const uint8_t * pixels = job->pixels;
+ 	uint32_t stride = job->stride;
+ 	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
+-	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
++	int32_t px0 = job->px0, py0 = job->py0, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
+ 	bool filter = job->filter;
+ 	/* Clip before the loop: a translated layer can have millions of rows
+ 	 * outside the panel. Empty horizontal clips must not index fColumn. */
+@@ -1019,6 +1020,7 @@
+ 		done = fb->fHelperGeneration;
+ 		job = fb->fHelperJob;
+ 		IOLockUnlock(fb->fHelperLock);
++		pong_fb_worker_prepare(index + 1, fb->fThreads);
+ 		/* share index + 1 of fThreads (the presenter takes share 0) */
+ 		int32_t first = job->py0 < 0 ? 0 : job->py0;
+ 		int32_t last = job->py1 > (int32_t) fb->fPanelHeight ? (int32_t) fb->fPanelHeight : job->py1;
+@@ -1319,6 +1321,7 @@
+ 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
+ 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+ 		IOLockUnlock(fSwapLock);
++		pong_fb_worker_prepare(0, fThreads);
+         {
+             static unsigned deq_log;
+             if (deq_log < 4) {
+--- /dev/null
++++ b/osfmk/kern/pong_fb_affinity.h
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: MIT
++ * Optional liuqin/SM8475 display-worker binding, fb_mid=1 with fb_threads=3.
++ * Mach-private implementation; IOKit calls only pong_fb_worker_prepare().
++ * CPU identity comes from ArmCpu's per-CPU MIDR reads, not an assumed ID mask.
++ */
++#pragma once
++#include <kern/processor.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++
++extern uint32_t pong_cpu_midr(unsigned cpu);
++void pong_fb_worker_prepare(unsigned worker, unsigned workers);
++static TUNABLE(uint32_t, gFBMiddle, "fb_mid", 0);
++
++typedef enum { kPongFBUntried, kPongFBBound, kPongFBSkipped, kPongFBFailed } PongFBBindState;
++typedef struct {
++	thread_t thread;
++	processor_t processor;
++	int cpu;
++	uint32_t midr;
++	PongFBBindState state, reported;
++	const char *reason;
++	uint64_t jobs;
++} PongFBBinding;
++/* Permanent kernel workers, like the existing framebuffer threads themselves.
++ * All slot access is serialized with CPU exit by processor_updown_lock. */
++static PongFBBinding gFBBindings[3];
++
++static bool
++pongFBIsMiddle(uint32_t midr)
++{
++	/* ARM implementer, architectural MIDR format, Cortex-A710 part. */
++	return (midr & 0xff0ffff0u) == 0x410fd470u;
++}
++
++static int
++pongFBMiddleCpu(const uint32_t *midrs, unsigned count, unsigned worker, unsigned workers)
++{
++	if (count > 8 || workers != 3 || worker >= workers) return -1;
++	unsigned found = 0;
++	int selected = -1;
++	for (unsigned cpu = 0; cpu < count; cpu++) {
++		if (!pongFBIsMiddle(midrs[cpu])) continue;
++		if (found == worker) selected = (int)cpu;
++		found++;
++	}
++	/* Refuse a partial or different topology instead of aliasing two workers. */
++	return found == 3 ? selected : -1;
++}
++
++static bool
++pongFBProcessorEligible(processor_t processor)
++{
++	/* Caller holds processor_updown_lock, also excluding shutdown-in-progress. */
++	if (processor == PROCESSOR_NULL || !processor->processor_booted ||
++	    processor->cpu_id < 0 || processor->cpu_id >= 8) return false;
++	processor_set_t pset = processor->processor_set;
++	if (pset == PROCESSOR_SET_NULL) return false;
++	spl_t s = splsched();
++	pset_lock(pset);
++	const uint64_t bit = 1ULL << processor->cpu_id;
++	bool eligible = processor->state >= PROCESSOR_IDLE && processor->state <= PROCESSOR_RUNNING &&
++	    !processor->processor_inshutdown && processor->is_recommended &&
++	    (pset->cpu_bitmask & pset->cpu_available_map & pset->recommended_bitmask & bit) != 0;
++	pset_unlock(pset);
++	splx(s);
++	return eligible;
++}
++
++typedef struct { int cpu; uint32_t midr; uint64_t mpidr; } PongFBCpuSample;
++static PongFBCpuSample
++pongFBCpuNow(void)
++{
++	/* Keep logical ID and both architectural register reads on the same CPU. */
++	disable_preemption();
++	int cpu = (int)ml_get_cpu_number_local();
++	uint64_t midr, mpidr;
++	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
++	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
++	enable_preemption();
++	return (PongFBCpuSample){cpu, (uint32_t)midr, mpidr};
++}
++
++void
++pong_fb_worker_prepare(unsigned worker, unsigned workers)
++{
++	if (gFBMiddle != 1 || worker >= 3) return;
++	/* No fLock, fSwapLock or fHelperLock held. In particular, migration must
++	 * not hold a lock the other row workers need to finish the current layer. */
++	lck_mtx_lock(&processor_updown_lock);
++	PongFBBinding *slot = &gFBBindings[worker];
++	thread_t self = current_thread();
++	if (slot->thread != THREAD_NULL && slot->thread != self) {
++		lck_mtx_unlock(&processor_updown_lock);
++		return; /* another framebuffer cannot replace an existing worker */
++	}
++	if (slot->state == kPongFBUntried) {
++		slot->thread = self;
++		thread_reference(self);
++		slot->state = kPongFBSkipped;
++		slot->reason = "identity-or-worker-count";
++		uint32_t midrs[8];
++		for (unsigned cpu = 0; cpu < 8; cpu++) midrs[cpu] = pong_cpu_midr(cpu);
++		slot->cpu = pongFBMiddleCpu(midrs, 8, worker, workers);
++		if (slot->cpu >= 0) {
++			slot->midr = midrs[slot->cpu];
++			slot->processor = cpu_to_processor(slot->cpu);
++			slot->reason = "cpu-not-eligible";
++			if (pongFBProcessorEligible(slot->processor)) {
++				spl_t s = splsched();
++				thread_lock(self);
++				bool bindable = self->bound_processor == PROCESSOR_NULL && self->sched_pri < BASEPRI_RTQUEUES;
++				thread_unlock(self);
++				splx(s);
++				slot->reason = "existing-binding-or-realtime";
++				if (bindable) {
++					/* The CPU-exit hook takes this same mutex before offlining;
++					 * keep it until thread_block has completed the migration. */
++					processor_t previous = thread_bind(slot->processor);
++					if (previous == PROCESSOR_NULL) {
++						slot->state = kPongFBBound;
++						slot->reason = "middle-core";
++						thread_block(THREAD_CONTINUE_NULL);
++					} else {
++						thread_bind(previous);
++					}
++				}
++			}
++		}
++	}
++	if (slot->state == kPongFBBound && (workers != 3 || !pongFBProcessorEligible(slot->processor))) {
++		thread_bind(PROCESSOR_NULL);
++		slot->state = kPongFBSkipped;
++		slot->reason = "cpu-no-longer-eligible";
++	}
++	PongFBCpuSample observed = pongFBCpuNow();
++	if (slot->state == kPongFBBound && (observed.cpu != slot->cpu || observed.midr != slot->midr)) {
++		thread_bind(PROCESSOR_NULL);
++		slot->state = kPongFBFailed;
++		slot->reason = "migration-identity-mismatch";
++	}
++	/* Three samples plus at most one fallback per worker, no per-frame log. */
++	uint64_t jobs = ++slot->jobs;
++	bool report = slot->reported != slot->state || (slot->state == kPongFBBound && (jobs == 128 || jobs == 1024));
++	slot->reported = slot->state;
++	PongFBBindState state = slot->state;
++	const char *reason = slot->reason;
++	int target = slot->cpu;
++	lck_mtx_unlock(&processor_updown_lock);
++	if (report) printf("Pong FB affinity: %s worker=%u target=%d actual=%d MIDR=%#x MPIDR=%#llx jobs=%llu reason=%s\n",
++	    state == kPongFBBound ? "PASS" : state == kPongFBFailed ? "FAIL" : "SKIP",
++	    worker, target, observed.cpu, observed.midr, observed.mpidr, jobs, reason);
++}
++
++/* processor_doshutdown invokes this while holding processor_updown_lock,
++ * before setting processor_inshutdown or removing the CPU from scheduling.
++ * Plain thread_bind has no offline fallback: detach only our registered
++ * workers, including sleeping, runnable and preempted workers. This hook
++ * performs no allocation, framebuffer locking, logging or hardware access. */
++static void
++pong_fb_cpu_exit(processor_t processor)
++{
++	for (unsigned worker = 0; worker < 3; worker++) {
++		PongFBBinding *slot = &gFBBindings[worker];
++		if (slot->state != kPongFBBound || slot->processor != processor) continue;
++		spl_t s = splsched();
++		thread_unbind_after_queue_shutdown(slot->thread, processor);
++		splx(s);
++		slot->state = kPongFBSkipped;
++		slot->reason = "cpu-exit-unbound";
++	}
++}
+--- a/osfmk/kern/machine.c
++++ b/osfmk/kern/machine.c
+@@ -130,6 +130,10 @@
+ #endif /* __x86_64__ */
+ #endif /* ML_IO_TIMEOUTS_ENABLED */
+ 
++#if defined(ARM64_BOARD_CONFIG_PONG) && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL
++#include <kern/pong_fb_affinity.h>
++#endif
++
+ /*
+  *	Exported variables:
+  */
+@@ -258,6 +262,12 @@
+ 	ml_cpu_begin_state_transition(processor->cpu_id);
+ 
+ 	ml_broadcast_cpu_event(CPU_EXIT_REQUESTED, processor->cpu_id);
++
++#if defined(ARM64_BOARD_CONFIG_PONG) && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL
++	/* Release optional display-worker bindings before the CPU leaves the
++	 * scheduler; bound run queues otherwise wait for that CPU to return. */
++	pong_fb_cpu_exit(processor);
++#endif
+ 
+ #if HIBERNATION
+ 	if (is_final_system_sleep) {

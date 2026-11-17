@@ -16,7 +16,7 @@
  * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
 enum : size_t {NativeAdrenoClientMaxObjects=NativeAdrenoVmMaxObjects};
 /* Pong: one isolated VA/queue window for each selected Metal process. */
-enum : unsigned {NativeAdrenoMaxClients=16};
+enum : unsigned {NativeAdrenoMaxClients=NativeAdrenoAbiMaxClientScopes};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {

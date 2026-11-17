@@ -18,6 +18,11 @@ Pong 专属实现。协议与服务结构参照 UniXNU-sheng 的 Qualcomm 实现
 
 - `libPongPower.a` 由 `scripts/build-pong-power-native.py` 生成，由主构建 force-load；`ArmDTPlatform` 在 CPU nubs 发布后调用电源入口。
 - 背光细节另见 `README.backlight.md`。固件（`adsp.mbn`）不进 Git，用 `refresh_runtime --power-firmware DIR` 或 `pong_adsp-fw=/abs/dir` 提供。
+- liuqin 选择 `PONG_BACKLIGHT_KTZ8866=1`：QUP0 SE1 / gpio6 / 0x11 的 KTZ8866，
+  不使用上述 Nothing OLED DCS 路径。通过私有 sysctl 或裸 user client 接 BKS 亮度请求。
+- liuqin 电池首轮选择 `PONG_POWER_BATTERY_ONLY=1`：原厂 PAS1 ADSP、
+  0x9fd00000/49 MiB carveout、小米电池字段，不构建/启动音频或 USB。
+  主机协议测试通过不代表设备已读到电量；见 `../../docs/BATTERY-LIUQIN.zh.md`。
 
 构建、接口与组件目录见 [UniXNU 组件目录](https://unixnu.com/reference/components)，板级输入与编译入口在 [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong)。
 

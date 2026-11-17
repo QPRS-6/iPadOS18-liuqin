@@ -1,0 +1,15 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2100,8 +2100,11 @@ handle_user_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_addr,
+ #endif /* MACH_ASSERT */
+ 
+ 		exit_with_mach_exception(current_proc(), info, flags);
+ 	}
+ 
++	extern void pong_bt_user_fault(uint64_t, uint64_t, uint64_t, uint64_t, unsigned, unsigned, uint64_t, uint64_t, uint64_t, uint64_t);
++	pong_bt_user_fault(get_saved_state_pc(state), get_saved_state_lr(state), fault_addr, esr, fault_code, fault_type,
++	    get_saved_state_reg(state, 0), get_saved_state_reg(state, 1), get_saved_state_reg(state, 8), get_saved_state_reg(state, 9));
+ 
+ 	exception_triage(exc, codes, numcodes);
+ 	__builtin_unreachable();

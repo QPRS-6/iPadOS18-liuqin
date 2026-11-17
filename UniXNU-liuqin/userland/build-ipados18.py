@@ -535,6 +535,14 @@ def jobs(root, cryptex, overlay, out, app_cryptex=None):
                 # real mobile-owned directory on this development port.
                 job.setdefault('EnvironmentVariables', {})['LS_DATABASE_DIR'] = \
                     '/private/var/mobile/Library/Pong/LaunchServices'
+            if folder == 'LaunchAngels' and label == 'com.apple.InputUI':
+                # InputUI is a native on-demand UI host. Retain the restore's
+                # launch-angel path/identity, not a daemon-role relocation.
+                angel = overlay / 'System/Library/LaunchAngels'
+                angel.mkdir(parents=True, exist_ok=True)
+                put_plist(angel / f.name, job)
+                cached_jobs['/System/Library/LaunchAngels/' + f.name] = job
+                continue
             put_plist(dest / f.name, job)
             # All selected definitions use this real canonical directory,
             # including launch angels. No /pong symlink changes cache keys.
@@ -863,6 +871,7 @@ def compile_ui(out, developer):
            '-Wl,-no_fixup_chains', '-install_name', '/pong/libpong-ui18.dylib',
            '-framework', 'CoreFoundation', '-framework', 'CoreGraphics', '-lobjc',
            str(PROJECT / 'userland/ui_compat18.c'),
+           str(PROJECT / 'userland/keyboard_creation18.c'),
            str(PROJECT / 'userland/settings_compat18.c'),
            str(PROJECT / 'userland/boot_snapshot18.c'),
            str(PROJECT / 'userland/touch.c'),
@@ -1133,9 +1142,9 @@ def os_copy(out, updating=True):
     return Path(tracked['image']) if tracked else raw
 
 
-def attach(image, mountpoint):
+def attach(image, mountpoint, *, owners=True):
     mountpoint.mkdir(exist_ok=True)
-    result = run(['hdiutil', 'attach', '-readwrite', '-nobrowse', '-noverify', '-owners', 'on',
+    result = run(['hdiutil', 'attach', '-readwrite', '-nobrowse', '-noverify', '-owners', 'on' if owners else 'off',
                   '-mountpoint', mountpoint, '-plist', image], capture_output=True)
     data = plistlib.loads(result.stdout)
     devices = data['system-entities']
@@ -1612,15 +1621,49 @@ def refresh_runtime(a):
 
 def refresh_metal(a):
     """Stage the matching native plugin in the real OS extension directory."""
-    if os.geteuid() != 0: raise RuntimeError('refresh_metal requires system authentication')
+    preserve = getattr(a, 'preserve_ownership', False)
+    if os.geteuid() != 0 and not preserve:
+        raise RuntimeError('refresh_metal requires system authentication or an existing bundle with --preserve-ownership')
     out, runtime = a.out.resolve(), a.runtime.resolve()
     report = json.loads((runtime / 'build-report.json').read_text())
     if report.get('guest') != '22H374': raise RuntimeError('Build a 22H374 Metal plugin first')
     bundle = runtime / 'PongAdrenoMetal.bundle'
     info = plistlib.loads((bundle / 'Info.plist').read_bytes())
     if info.get('CFBundleIdentifier') != 'dev.unixnu.pong.Metal': raise RuntimeError('Unexpected Metal bundle')
-    device = attach(os_copy(out), out / 'system-mount')
+    image = os_copy(out)
+    if preserve and (image.is_symlink() or not image.is_file()):
+        raise RuntimeError('--preserve-ownership requires a regular prepared OS image copy')
+    device = attach(image, out / 'system-mount', owners=not preserve)
+    updated = []
     try:
+        def apple_double(path):
+            # SMB represents host extended attributes as AppleDouble files.
+            # They are transport metadata, not members of the guest bundle.
+            if not path.name.startswith('._') or path.is_symlink() or not path.is_file():
+                return False
+            if not path.with_name(path.name[2:]).exists():
+                return False
+            with path.open('rb') as stream:
+                return stream.read(8) == struct.pack('>II', 0x00051607, 0x00020000)
+
+        def metadata(path):
+            value = path.lstat()
+            if not stat.S_ISREG(value.st_mode):
+                raise RuntimeError('In-place Metal update needs an existing regular file: ' + str(path))
+            return value.st_uid, value.st_gid, stat.S_IMODE(value.st_mode), value.st_flags
+
+        def replace_existing(source, destination):
+            before = metadata(destination)
+            if source.is_symlink() or not source.is_file():
+                raise RuntimeError('Metal input must be an ordinary file: ' + str(source))
+            # Truncate/write the existing inode: unlike unlink+copytree this
+            # retains the guest's ownership, modes, flags and other metadata
+            # when a user-owned OS clone is mounted with ownership ignored.
+            shutil.copyfile(source, destination)
+            if metadata(destination) != before:
+                raise RuntimeError('Metal file attributes changed: ' + str(destination))
+            updated.append('/' + str(destination.relative_to(out / 'system-mount')))
+
         extensions = out / 'system-mount/System/Library/Extensions'
         if extensions.is_symlink(): raise RuntimeError('Native18 requires a real Extensions directory')
         extensions.mkdir(parents=True, exist_ok=True)
@@ -1629,15 +1672,33 @@ def refresh_metal(a):
         if target.exists():
             old = plistlib.loads((target / 'Info.plist').read_bytes())
             if old.get('CFBundleIdentifier') != info['CFBundleIdentifier']: raise RuntimeError('Preserving a foreign bundle')
-            shutil.rmtree(target)
-        shutil.copytree(bundle, target)
-        for name in ('PongAdrenoMetal.publish', 'PongAdrenoMetal.clients'):
-            shutil.copyfile(runtime / name, extensions / name)
-            os.chown(extensions / name, 0, 0); os.chmod(extensions / name, 0o644)
-        for path in [target, *target.rglob('*')]:
-            if path.is_symlink(): raise RuntimeError('Plugin must contain ordinary owned files')
-            os.chown(path, 0, 0)
-            os.chmod(path, 0o755 if path.is_dir() or path.name != 'Info.plist' else 0o644)
+        if preserve:
+            if not target.is_dir(): raise RuntimeError('In-place Metal update needs the previous bundle')
+            pairs = []
+            for source in sorted(bundle.rglob('*')):
+                if apple_double(source): continue
+                destination = target / source.relative_to(bundle)
+                if source.is_symlink() or destination.is_symlink(): raise RuntimeError('Unexpected Metal file alias')
+                if source.is_dir():
+                    if not destination.is_dir(): raise RuntimeError('In-place update cannot add a bundle directory')
+                else:
+                    pairs.append((source, destination))
+            pairs.extend((runtime / name, extensions / name) for name in
+                         ('PongAdrenoMetal.publish', 'PongAdrenoMetal.clients'))
+            # Check the complete layout before the first replacement.
+            for _, destination in pairs: metadata(destination)
+            for source, destination in pairs: replace_existing(source, destination)
+        else:
+            if target.exists(): shutil.rmtree(target)
+            shutil.copytree(bundle, target, ignore=lambda directory, names:
+                            [name for name in names if apple_double(Path(directory) / name)])
+            for name in ('PongAdrenoMetal.publish', 'PongAdrenoMetal.clients'):
+                shutil.copyfile(runtime / name, extensions / name)
+                os.chown(extensions / name, 0, 0); os.chmod(extensions / name, 0o644)
+            for path in [target, *target.rglob('*')]:
+                if path.is_symlink(): raise RuntimeError('Plugin must contain ordinary owned files')
+                os.chown(path, 0, 0)
+                os.chmod(path, 0o755 if path.is_dir() or path.name != 'Info.plist' else 0o644)
         # iOS keeps a client's whole GPU stack inside cameracaptured, so the
         # stock 27 MB inactive hard limit (J171/J172) ends that service about
         # half a second after launch. It then respawns forever and every app
@@ -1650,14 +1711,20 @@ def refresh_metal(a):
             if not isinstance(entry, dict) or entry.get('InactiveHardMemoryLimit') == -1:
                 continue
             entry['InactiveHardMemoryLimit'] = -1
+            before = metadata(jetsam) if preserve else None
             jetsam.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
-            os.chown(jetsam, 0, 0)
-            os.chmod(jetsam, 0o644)
+            if preserve:
+                if metadata(jetsam) != before: raise RuntimeError('Jetsam file attributes changed')
+            else:
+                os.chown(jetsam, 0, 0)
+                os.chmod(jetsam, 0o644)
+            updated.append('/' + str(jetsam.relative_to(out / 'system-mount')))
             print('jetsam: cameracaptured inactive hard limit -> unlimited (' + jetsam.name + ')')
     finally:
         run(['hdiutil', 'detach', device])
     dump(runtime / 'os-metal-update.json', dict(build='22H374',
-         path='/System/Library/Extensions/PongAdrenoMetal.bundle', data_modified=False,
+          path='/System/Library/Extensions/PongAdrenoMetal.bundle', data_modified=False,
+          preserve_existing_ownership=preserve, updated_files=updated,
          publication='real CP/fence and runtime ABI prerequisites; stock discovery',
          hardware_acceleration_confirmed=False, image_verification='skipped by request'))
 
@@ -1767,6 +1834,8 @@ def main():
     s.add_argument('--enable-audio-hal', action='store_true', help='Install the physical-readiness-gated Pong output HAL')
     s = sub.add_parser('refresh_metal'); s.add_argument('--out', type=Path, required=True)
     s.add_argument('--runtime', type=Path, required=True)
+    s.add_argument('--preserve-ownership', action='store_true',
+                   help='Update an existing bundle in place in a prepared OS clone, retaining guest inode attributes')
     s = sub.add_parser('refresh_cryptex'); s.add_argument('--out', type=Path, required=True)
     s.add_argument('--system-cryptex', type=Path, required=True)
     for mode in sub.choices.values():

@@ -36,7 +36,8 @@ enum {
     NativeAdrenoMethodSyncHostRange = 19,
     NativeAdrenoMethodSyncHostBatch = 20,
     NativeAdrenoAbiMetadataBytes = 64,
-    NativeAdrenoAbiMaxQueues = 8
+    NativeAdrenoAbiMaxQueues = 8,
+    NativeAdrenoAbiMaxClientScopes = 32 /* internal queue-scope capacity; wire records unchanged */
 };
 struct NativeAdrenoAbiParams {
     uint32_t abi_version;

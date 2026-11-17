@@ -8,7 +8,10 @@ extern kmod_info_t g_kernel_kmod_info;
 #include "../PongBootCapture/PongBootCapture.h"
 #include "../PongUsb/PongUsbDevice.h"
 extern "C" {
-#ifndef PONG_POWER_BACKLIGHT_ONLY
+#ifdef PONG_BLUETOOTH
+void pong_bluetooth_start_optional(void);
+#endif
+#if !defined(PONG_POWER_BACKLIGHT_ONLY) && !defined(PONG_POWER_BATTERY_ONLY)
 void PongAudioServiceStaticInit(void);
 bool pong_audio_service_classes_ready(void) {
  static uint32_t state;
@@ -63,6 +66,10 @@ pong_halt_restart(unsigned int type)
 }
 void pong_power_start_optional(void) {
  pong_rpmh_init();
+#ifdef PONG_BLUETOOTH
+ // Bluetooth UART/HCI is independent of the ADSP/audio endpoint.
+ pong_bluetooth_start_optional();
+#endif
  static uint32_t halt_installed;
  if (!__atomic_exchange_n(&halt_installed, 1, __ATOMIC_ACQ_REL)) {
   previous_halt_restart = PE_halt_restart;
@@ -71,7 +78,9 @@ void pong_power_start_optional(void) {
 #ifndef PONG_POWER_BACKLIGHT_ONLY
  // Register the transport classes independently of ADSP readiness. Actual
  // USB/audio services still publish only after their own hardware succeeds.
- if(pong_audio_service_classes_ready())PongUsb::start();
+#ifndef PONG_POWER_BATTERY_ONLY
+  if(pong_audio_service_classes_ready())PongUsb::start();
+#endif
  unsigned enabled=0;PE_parse_boot_argn("pong_adsp",&enabled,sizeof(enabled));
  if(enabled!=2)return;
  static uint32_t started;
@@ -81,7 +90,9 @@ void pong_power_start_optional(void) {
  // only after firmware and PAS prerequisites complete on its worker.
  void *h=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
  if(h){PongBatteryStaticInit();if(!OSMetaClass::postModLoad(h))sheng_battery_start();}
- sheng_audio_probe();
+#ifndef PONG_POWER_BATTERY_ONLY
+  sheng_audio_probe();
+#endif
 #endif /* PONG_POWER_BACKLIGHT_ONLY */
 }
 }

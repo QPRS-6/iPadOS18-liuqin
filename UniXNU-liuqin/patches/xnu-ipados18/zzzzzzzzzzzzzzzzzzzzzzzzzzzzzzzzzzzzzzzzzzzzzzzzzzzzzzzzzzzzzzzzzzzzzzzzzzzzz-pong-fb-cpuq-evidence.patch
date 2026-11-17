@@ -1,0 +1,12 @@
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -163,3 +163,4 @@
+ static TUNABLE(uint32_t, gThreads, "fb_threads", 1);
+ extern "C" void pong_fb_worker_prepare(unsigned worker, unsigned workers);
++extern "C" void pong_cpu_qos_report(void);
+ #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+@@ -1204,3 +1205,4 @@
+ IOMobileFramebuffer::reportFrameTimes(void)
+ {
++	pong_cpu_qos_report();
+ 	static const uint32_t limits[] = { 10, 18, 26, 35, FRAME_TIMES + 1 };

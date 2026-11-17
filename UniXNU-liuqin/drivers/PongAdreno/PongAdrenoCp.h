@@ -17,6 +17,7 @@ struct PongCpBackend {
     NativeAdrenoAbiDeviceInfo info;
     unsigned output_bits;
     bool (*healthy)();
+    unsigned input_bits=32;
 };
 /* prepare is called while GX and the CM3 are still stopped; nothing published.
  * start requires the actual GMU power ACK, GX OOB and START ACK. */

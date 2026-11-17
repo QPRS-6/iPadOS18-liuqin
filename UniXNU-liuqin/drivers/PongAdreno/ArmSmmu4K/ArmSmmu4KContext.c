@@ -35,10 +35,11 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     unsigned va=width_bits((c->id2>>8)&15),pa=width_bits((c->id2>>4)&15);
     if(!(c->id0&(UINT32_C(1)<<30)) || !(c->id2&(1u<<12)) || !va || !pa)return ArmSmmu4KUnsupported;
     const ArmSmmu4KConfig *basis=c->lower?c->lower:c->upper;
-    /* Pong admits only untagged low32-bit addresses. Ignoring bits63:56
-     * cannot change any admitted address; do not extend this policy to an
-     * unqualified upper or wider address range. */
-    if(c->ignore_top_byte && (c->upper || !c->lower || c->lower->input_bits!=32))
+    /* Pong's low32/opt-in low36 profiles reject tagged addresses at every
+     * mapping boundary. Ignoring bits63:56 changes no admitted address.
+     * Upper regions and other widths remain outside this board policy. */
+    if(c->ignore_top_byte && (c->upper || !c->lower ||
+        (c->lower->input_bits!=32 && c->lower->input_bits!=36)))
         return ArmSmmu4KUnsupported;
     if(basis->output_bits>pa || (c->lower && c->lower->input_bits>va) ||
         (c->upper && (c->upper->input_bits>va || c->upper->output_bits!=basis->output_bits)))return ArmSmmu4KUnsupported;

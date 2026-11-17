@@ -113,10 +113,7 @@ volatile uint32_t native_adreno_mount_fail[4];
 struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
 struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
 }
-/* ABI1 still shares one32-bit space. Keep both UI reservations unchanged;
- * lease the remaining VA by live process demand instead of wasting fourteen
- * fixed128MiB windows. These are VA leases, never wired RAM reservations. */
-struct NativeAdrenoClientWindow {uint64_t start=0,bytes=0;};
+#include "NativeAdrenoClientWindow.h"
 
 namespace {
 void shiftName(char names[3][17]) {
@@ -142,36 +139,8 @@ struct Published {
 } g;
 static NativeAdrenoClientWindow clientWindow(unsigned slot,const char *name)
 {
-    if(slot==0)return {0x20000000ull,0x50000000ull};
-    if(slot==1)return {0x70000000ull,0x20000000ull};
-    bool poster=false;
-    for(unsigned at=0;at<20 && name[at];++at)
-        if(!strncmp(name+at,"Poster",6) || !strncmp(name+at,"Wallpaper",9)) {poster=true;break;}
-    // MercuryPoster hit real device-VA OOM with128MiB while importing its
-    // FP16 targets. Prefer384MiB for posters,256MiB for input/preferences,
-    //128MiB otherwise. Search actual holes; never relocate a live mapping.
-    // Posters still get384MiB (their FP16 targets), but every other client now
-    // asks for64MiB: the32-bit GPU VA pool fragmented below the old128MiB
-    // default during the boot widget storm and mount failed with no space.
-    uint64_t preferred=poster?0x0c000000ull:
-        (!strcmp(name,"InputUI") || !strcmp(name,"Preferences"))?0x08000000ull:0x04000000ull;
-    // Keep the per-client window unchanged while space is free. Under
-    // pressure, step down in 32 MiB units so a fragmented pool can still
-    // place a small lease instead of failing the mount with no space.
-    for(uint64_t amount=preferred;amount>=0x02000000ull;amount-=0x02000000ull) {
-        uint64_t start=0x90000000ull;
-        for(unsigned pass=0;pass<=NativeAdrenoMaxClients && start+amount<=0x100000000ull;++pass) {
-            uint64_t next=start;
-            for(unsigned i=2;i<NativeAdrenoMaxClients;++i)if(g.slots[i]) {
-                const auto &window=g.windows[i];
-                if(start<window.start+window.bytes && window.start<start+amount && next<window.start+window.bytes)
-                    next=window.start+window.bytes;
-            }
-            if(next==start)return {start,amount};
-            start=next;
-        }
-    }
-    return {};
+    (void)name;
+    return nativeAdrenoClientWindow<NativeAdrenoMaxClients>(slot,g.input_bits);
 }
 }
 
@@ -302,7 +271,7 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
     else {
         if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
         if(!strncmp(name_,"SpringBoard",sizeof name_) && !g.slots[1])slot=1;
-        for(unsigned i=2;slot==NativeAdrenoMaxClients && i<NativeAdrenoMaxClients;++i)if(!g.slots[i])slot=i;
+        for(unsigned i=2;slot==NativeAdrenoMaxClients && i<nativeAdrenoClientCapacity(g.input_bits);++i)if(!g.slots[i])slot=i;
     }
     const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
     IOReturn result=opened;
@@ -413,7 +382,7 @@ IOReturn AGXDeviceUserClient::clientClose()
         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
         if(!status) {
             live_=false;
-            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients)g.slots[slot_]=false;
+            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients){g.slots[slot_]=false;g.windows[slot_]={};}
             ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
             if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
                 record->closes=record->closes+1;record->slot=0xff;
@@ -423,6 +392,7 @@ IOReturn AGXDeviceUserClient::clientClose()
     }
     IOLockUnlock(g.lock);
     if(mailbox)mailbox->release();
+    if(status)IOLog("Pong Adreno: client %s close failed slot=%u result=0x%x; live mappings retained\n",name_,slot_,status);
     if(!status)terminate();
     return status;
 }

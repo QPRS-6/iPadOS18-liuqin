@@ -1,0 +1,15 @@
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -1173,6 +1173,12 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
+ 		IOLockUnlock(fHelperLock);
+ 		drawRows(&job, visibleY0, visibleY1, fBlendRow);
+ 		return;
+ 	}
++	static bool reportedParallelRows;
++	if (!reportedParallelRows) {
++		reportedParallelRows = true;
++		IOLog("MiniIOMobileFramebuffer: parallel rows workers=%u started_helpers=%u rows=%u\n",
++		    fThreads, fHelpersStarted, (unsigned)(visibleY1 - visibleY0));
++	}
+ 	fHelperJob = &job;
+ 	fHelpersBusy = fThreads - 1;

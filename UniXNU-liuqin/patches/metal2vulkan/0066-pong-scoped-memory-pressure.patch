@@ -1,0 +1,845 @@
+From: PongPlatform24 <local>
+Subject: [PATCH] runtime: bound speculative growth and recover heap-local idle memory
+
+Prepared 22H374 source needs the scoped-heap allocator contract too.
+Keep live placements, use the actual size for exact fallback blocks,
+and make host imports participate in bounded same-heap reclamation.
+The recording Vulkan tests exercise the production allocation path.
+
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -11,7 +11,8 @@
+ //!   a working set that dips by a block and comes back a frame later (a frame's buffers, returned
+ //!   as its command buffer completes) makes and frees no block for it. Every kept empty block but
+ //!   one goes once it stayed empty for [`KEPT_EMPTY_FOR`] ([`Pool::stale`]), and every one of a
+-//!   memory type goes before a block of that type fails to be made ([`place`]).
++//!   memory heap goes before a required allocation on that heap fails ([`place`]). A growth
++//!   block that still does not fit is retried at the resource's exact size, as a dedicated block.
+ //! - **Entry point.** [`allocate`] with the resource's memory requirements and its
+ //!   [`MemoryClass`]; [`Memory::free`] with the placement it gave. Buffers use it in step 1;
+ //!   textures and heaps add their classes and callers in their own steps. Imported host memory
+@@ -63,8 +64,28 @@
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-/// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
++/// The largest pooled block, also bounded by the advertised heaps and `maxMemoryAllocationSize`.
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
++
++/// Bound speculative pooling by the memory the device actually exposes, which can be a scoped
++/// GPU address window rather than all system RAM. Each pool may keep both live and empty blocks;
++/// no single growth block takes more than a sixteenth of the smallest advertised usable heap.
++/// Missing heap facts leave the ordinary cap; required resources are not limited by this cap.
++fn scoped_block_bytes(properties: &vk::PhysicalDeviceMemoryProperties, max_allocation: u64) -> u64 {
++    let count = (properties.memory_type_count as usize).min(vk::MAX_MEMORY_TYPES);
++    let heap_count = (properties.memory_heap_count as usize).min(vk::MAX_MEMORY_HEAPS);
++    let heap_bytes = properties.memory_types[..count]
++        .iter()
++        .filter(|ty| allocatable(ty.property_flags))
++        .filter_map(|ty| properties.memory_heaps[..heap_count].get(ty.heap_index as usize))
++        .map(|heap| heap.size)
++        .filter(|&size| size != 0)
++        .min()
++        .unwrap_or(BLOCK_BYTES * 16);
++    BLOCK_BYTES
++        .min((heap_bytes / 16).max(4096))
++        .min(max_allocation.max(1))
++}
+ 
+ /// The most empty pooled blocks a pool keeps for its next placements ([`Pool::release`]), at
+ /// most 128 MiB of empty memory a pool. In a pool the encodings place in, one of them is mostly
+@@ -79,11 +100,13 @@
+ fn board_spare_limit() -> Option<u64> {
+     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+     *LIMIT.get_or_init(|| {
+-        std::env::var("METAL2VULKAN_SPARE_IMAGE_MIB").ok()?
+-            .parse::<u64>().ok()?.checked_mul(1 << 20)
++        std::env::var("METAL2VULKAN_SPARE_IMAGE_MIB")
++            .ok()?
++            .parse::<u64>()
++            .ok()?
++            .checked_mul(1 << 20)
+     })
+ }
+-
+ 
+ /// How long a kept empty pooled block beyond its pool's one stays empty before it is freed
+ /// ([`Pool::stale`]): a frame's dip comes back well within it.
+@@ -107,7 +130,7 @@
+ /// lazily allocated memory is backed at the first pass (every pass renders in system memory), each
+ /// one was a new 40-112 MiB allocation wired page by page, 1.4 s of an iPadOS render server's
+ /// first minute in 29 of them, and its free unwired it again. No count or byte limit: as the
+-/// pooled blocks kept empty, the spares go when a block of their type cannot be made
++/// pooled blocks kept empty, the spares go when an allocation on their heap cannot be made
+ /// ([`Memory::release_kept`]) and when the system reports memory pressure
+ /// ([`Memory::release_spare`]).
+ pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
+@@ -190,6 +213,17 @@
+     NoMemoryType,
+     /// The allocation of the last type tried failed.
+     Vulkan(vk::Result),
++}
++
++impl ImportFailure {
++    fn out_of_memory(self) -> bool {
++        matches!(
++            self,
++            Self::Vulkan(
++                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
++            )
++        )
++    }
+ }
+ 
+ /// Whether the runtime may allocate memory of a type with `flags`: any type but the
+@@ -586,7 +620,14 @@
+         let kept = (self.blocks.iter().enumerate())
+             .filter(|&(other, block)| other != index && block.as_ref().is_some_and(PoolBlock::kept))
+             .count();
+-        if !dedicated && kept < if board_spare_limit().is_some() { 1 } else { KEPT_EMPTY_BLOCKS } {
++        if !dedicated
++            && kept
++                < if board_spare_limit().is_some() {
++                    1
++                } else {
++                    KEPT_EMPTY_BLOCKS
++                }
++        {
+             if let Some(block) = self.blocks[index].as_mut() {
+                 block.emptied = Some(now);
+             }
+@@ -659,7 +700,9 @@
+             let (count, total) = match (imported(&block.payload), block.dedicated) {
+                 (true, _) => (&mut census.imported, &mut census.imported_bytes),
+                 (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
+-                (false, false) if block.ranges.is_empty() => (&mut census.empty, &mut census.empty_bytes),
++                (false, false) if block.ranges.is_empty() => {
++                    (&mut census.empty, &mut census.empty_bytes)
++                }
+                 (false, false) => {
+                     census.pooled_used_bytes += block.ranges.used();
+                     (&mut census.pooled, &mut census.pooled_bytes)
+@@ -1092,6 +1135,8 @@
+     /// The dedicated blocks of images kept for the next dedicated image of their pool
+     /// ([`SPARE_FOR`]).
+     spare: Vec<Spare>,
++    /// Bounded allocation-pressure evidence, only formatted on a refused allocation.
++    pressure_reports: u32,
+ }
+ 
+ impl Memory {
+@@ -1114,7 +1159,7 @@
+                 .map(|_| Pool::default())
+                 .collect(),
+             types,
+-            block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
++            block_bytes: scoped_block_bytes(properties, max_allocation),
+             device_address,
+             address_types: None,
+             kept: None,
+@@ -1128,6 +1173,7 @@
+             log: None,
+             binds_wait: binds_wait(driver),
+             spare: Vec::new(),
++            pressure_reports: 0,
+         }
+     }
+ 
+@@ -1208,6 +1254,27 @@
+             census.empty_bytes += spare.block.size;
+         }
+         census
++    }
++
++    /// Name the resource versus its speculative block, and what still owns memory. These are
++    /// allocator bytes, not free system RAM, and a recovered attempt is not a failed command.
++    fn note_pressure(
++        &mut self,
++        holds: Holds,
++        type_index: u32,
++        required: u64,
++        block: u64,
++        import: bool,
++    ) {
++        if self.pressure_reports >= 8 {
++            return;
++        }
++        self.pressure_reports += 1;
++        let c = self.census();
++        eprintln!(
++            "metal2vulkan: memory pressure pid={} holds={holds:?} type={type_index} required={required} block={block} import={import} pooled={} used={} idle={} dedicated={} imports={}",
++            std::process::id(), c.pooled_bytes, c.pooled_used_bytes, c.empty_bytes, c.dedicated_bytes, c.imported_bytes
++        );
+     }
+ 
+     /// Whether one of the memory types `allowed` names is of `class`.
+@@ -1480,11 +1547,17 @@
+         }
+         self.age_spare(device, now);
+         match freed {
+-            Some((block, true)) if holds == Holds::Images && block.plain() &&
+-                board_spare_limit().map_or(true, |limit| {
+-                    let kept = self.spare.iter().fold(0u64, |sum, spare| sum.saturating_add(spare.block.size));
+-                    block.size <= limit.saturating_sub(kept)
+-                }) => {
++            Some((block, true))
++                if holds == Holds::Images
++                    && block.plain()
++                    && board_spare_limit().map_or(true, |limit| {
++                        let kept = self
++                            .spare
++                            .iter()
++                            .fold(0u64, |sum, spare| sum.saturating_add(spare.block.size));
++                        block.size <= limit.saturating_sub(kept)
++                    }) =>
++            {
+                 self.say_block("kept a dedicated block of an image spare", &block);
+                 self.spare.push(Spare {
+                     pool: (holds, type_index),
+@@ -1505,16 +1578,23 @@
+         }
+     }
+ 
+-    /// Release every kept empty pooled block of memory type `type_index`, of buffers and of
+-    /// images, as a block of that type fails to be made ([`place`]): how many went.
++    /// Release kept empty blocks of buffers and images on `type_index`'s heap, including spare
++    /// dedicated images: memory types on one heap consume the same budget. Live placements and
++    /// other heaps retain their blocks. How many went.
+     fn release_kept(&mut self, device: &ash::Device, type_index: u32) -> usize {
+-        let mut blocks: Vec<Block> = [Holds::Buffers, Holds::Images]
+-            .into_iter()
+-            .flat_map(|holds| self.pool(holds, type_index).take_kept())
+-            .collect();
++        let heap = self.types[type_index as usize].heap_index;
++        let mut blocks = Vec::new();
++        for index in 0..self.types.len() {
++            if self.types[index].heap_index == heap {
++                for holds in [Holds::Buffers, Holds::Images] {
++                    blocks.extend(self.pool(holds, index as u32).take_kept());
++                }
++            }
++        }
++        let types = &self.types;
+         blocks.extend(
+             (self.spare)
+-                .extract_if(.., |spare| spare.pool.1 == type_index)
++                .extract_if(.., |spare| types[spare.pool.1 as usize].heap_index == heap)
+                 .map(|spare| spare.block),
+         );
+         let count = blocks.len();
+@@ -1528,7 +1608,9 @@
+     /// Free the spare blocks that stayed spare for [`SPARE_FOR`] at `now`.
+     fn age_spare(&mut self, device: &ash::Device, now: Instant) {
+         let stale: Vec<Spare> = (self.spare)
+-            .extract_if(.., |spare| now.saturating_duration_since(spare.since) >= SPARE_FOR)
++            .extract_if(.., |spare| {
++                now.saturating_duration_since(spare.since) >= SPARE_FOR
++            })
+             .collect();
+         for spare in stale {
+             // SAFETY: nothing is placed in a spare block, and no command reads it.
+@@ -1681,8 +1763,23 @@
+         let types = candidates(&self.types, allowed, class, self.unified);
+         let imported = view.as_ref().map_or(pointer, ReadOnlyView::pointer);
+         // SAFETY: the caller's contract; the view stays mapped while the block holds it.
+-        let (memory, type_index) =
+-            unsafe { import_pointer(device, imported, size, &types, self.device_address) }?;
++        let mut made =
++            unsafe { import_pointer(device, imported, size, &types, self.device_address) };
++        if made.as_ref().is_err_and(|error| error.out_of_memory()) {
++            if let Some(&index) = types.last() {
++                self.note_pressure(Holds::Buffers, index, size, size, true);
++            }
++            let released: usize = types
++                .iter()
++                .map(|&index| self.release_kept(device, index))
++                .sum();
++            if released != 0 {
++                // SAFETY: the original pages and optional read-only view remain owned here.
++                made =
++                    unsafe { import_pointer(device, imported, size, &types, self.device_address) };
++            }
++        }
++        let (memory, type_index) = made?;
+         let block = Block {
+             memory,
+             size,
+@@ -2028,8 +2125,19 @@
+     let (pointer, size) = (pages.pointer(), pages.length());
+     // SAFETY: the pages stay mapped until the block that takes them is freed, and their pointer
+     // and length are multiples of the import alignment (`Device::fresh_page_buffer`).
+-    let (raw, type_index) =
+-        unsafe { import_pointer(device, pointer, size, &[type_index], device_address) }?;
++    let mut made = unsafe { import_pointer(device, pointer, size, &[type_index], device_address) };
++    if made.as_ref().is_err_and(|error| error.out_of_memory()) {
++        let released = {
++            let mut memory = lock(memory);
++            memory.note_pressure(Holds::Buffers, type_index, size, size, true);
++            memory.release_kept(device, type_index)
++        };
++        if released != 0 {
++            // SAFETY: `pages` still owns the same aligned mapping, with no lock held.
++            made = unsafe { import_pointer(device, pointer, size, &[type_index], device_address) };
++        }
++    }
++    let (raw, type_index) = made?;
+     let block = Block {
+         memory: raw,
+         size,
+@@ -2213,11 +2321,11 @@
+     if candidates.is_empty() {
+         return Err(Error::OutOfMemory(MemoryKind::Device));
+     }
+-    let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
+     for type_index in candidates {
+         let pool = (holds, type_index);
+-        let block_size = match dedicated {
++        let mut dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
++        let mut block_size = match dedicated {
+             true => size,
+             false => lock(memory).next_block_bytes(pool, size),
+         };
+@@ -2241,13 +2349,24 @@
+                 return Ok(placement);
+             }
+         }
+-        // The type's kept empty blocks go before a block of it fails to be made.
+-        let made = match maker.make(device, type_index, block_size, addressed) {
+-            Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {
+-                maker.make(device, type_index, block_size, addressed)
++        let mut made = maker.make(device, type_index, block_size, addressed);
++        if matches!(&made, Err(Error::OutOfMemory(_))) {
++            let released = {
++                let mut memory = lock(memory);
++                memory.note_pressure(holds, type_index, size, block_size, false);
++                memory.release_kept(device, type_index)
++            };
++            if released != 0 {
++                made = maker.make(device, type_index, block_size, addressed);
+             }
+-            made => made,
+-        };
++            // Pool growth is optional; the resource's memory is not. The exact block is
++            // dedicated and recorded at its actual capacity, including addressed buffers.
++            if block_size > size && matches!(&made, Err(Error::OutOfMemory(_))) {
++                block_size = size;
++                dedicated = true;
++                made = maker.make(device, type_index, block_size, addressed);
++            }
++        }
+         match made {
+             Ok(block) => {
+                 let mut memory = lock(memory);
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -162,6 +162,7 @@
+ mod managed;
+ mod memo;
+ mod memory;
++mod memory_pressure;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod memory_frees;
+ mod memory_reads;
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/memory_pressure.rs
+@@ -0,0 +1,447 @@
++//! The real allocator against a bounded Vulkan allocation table. No GPU is opened.
++use crate::error::{Error, MemoryKind};
++use crate::memory::{self, Memory, MemoryClass};
++use crate::work_counts::Counters;
++use ash::vk::{self, Handle};
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++use std::ffi::c_void;
++use std::ptr::NonNull;
++use std::sync::Mutex;
++
++const MIB: u64 = 1 << 20;
++
++struct Driver {
++    next: u64,
++    heaps: [u64; 2],
++    used: [u64; 2],
++    type_heaps: Vec<usize>,
++    largest: u64,
++    fail_next: Option<vk::Result>,
++    attempts: Vec<(u64, u32)>,
++    live: BTreeMap<u64, (u64, usize)>,
++    buffers: BTreeMap<u64, (u64, Option<u64>)>,
++    freed: Vec<u64>,
++}
++
++impl Default for Driver {
++    fn default() -> Self {
++        Self {
++            next: 1,
++            heaps: [256 * MIB; 2],
++            used: [0; 2],
++            type_heaps: vec![0],
++            largest: u64::MAX,
++            fail_next: None,
++            attempts: Vec::new(),
++            live: BTreeMap::new(),
++            buffers: BTreeMap::new(),
++            freed: Vec::new(),
++        }
++    }
++}
++
++thread_local! {
++    static DRIVER: RefCell<Driver> = RefCell::new(Driver::default());
++}
++
++unsafe extern "system" fn allocate(
++    _: vk::Device,
++    info: *const vk::MemoryAllocateInfo<'_>,
++    _: *const vk::AllocationCallbacks<'_>,
++    out: *mut vk::DeviceMemory,
++) -> vk::Result {
++    // SAFETY: ash passes a live allocation info and one writable output handle.
++    let info = unsafe { &*info };
++    DRIVER.with_borrow_mut(|d| {
++        d.attempts
++            .push((info.allocation_size, info.memory_type_index));
++        if let Some(error) = d.fail_next.take() {
++            return error;
++        }
++        let heap = d.type_heaps[info.memory_type_index as usize];
++        let size = info.allocation_size;
++        if size > d.largest || size > d.heaps[heap].saturating_sub(d.used[heap]) {
++            return vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
++        }
++        let id = d.next;
++        d.next += 1;
++        d.used[heap] += size;
++        assert!(d.live.insert(id, (size, heap)).is_none());
++        // SAFETY: the caller's writable handle, only published on success.
++        unsafe { out.write(vk::DeviceMemory::from_raw(id)) };
++        vk::Result::SUCCESS
++    })
++}
++
++unsafe extern "system" fn free(
++    _: vk::Device,
++    memory: vk::DeviceMemory,
++    _: *const vk::AllocationCallbacks<'_>,
++) {
++    DRIVER.with_borrow_mut(|d| {
++        let id = memory.as_raw();
++        assert!(d.buffers.values().all(|(_, bound)| *bound != Some(id)));
++        let (size, heap) = d.live.remove(&id).expect("memory freed once");
++        d.used[heap] -= size;
++        d.freed.push(id);
++    });
++}
++
++unsafe extern "system" fn create_buffer(
++    _: vk::Device,
++    info: *const vk::BufferCreateInfo<'_>,
++    _: *const vk::AllocationCallbacks<'_>,
++    out: *mut vk::Buffer,
++) -> vk::Result {
++    // SAFETY: ash passes a live create info and a writable output handle.
++    let size = unsafe { (*info).size };
++    DRIVER.with_borrow_mut(|d| {
++        let id = d.next;
++        d.next += 1;
++        assert!(d.buffers.insert(id, (size, None)).is_none());
++        // SAFETY: the caller's writable handle.
++        unsafe { out.write(vk::Buffer::from_raw(id)) };
++    });
++    vk::Result::SUCCESS
++}
++
++unsafe extern "system" fn destroy_buffer(
++    _: vk::Device,
++    buffer: vk::Buffer,
++    _: *const vk::AllocationCallbacks<'_>,
++) {
++    DRIVER.with_borrow_mut(|d| {
++        assert!(d.buffers.remove(&buffer.as_raw()).is_some());
++    });
++}
++
++unsafe extern "system" fn buffer_requirements(
++    _: vk::Device,
++    buffer: vk::Buffer,
++    out: *mut vk::MemoryRequirements,
++) {
++    DRIVER.with_borrow(|d| {
++        let size = d.buffers[&buffer.as_raw()].0.next_multiple_of(256);
++        // SAFETY: ash passes a writable requirements record.
++        unsafe { out.write(requirements(size, u32::MAX)) };
++    });
++}
++
++unsafe extern "system" fn bind_buffer(
++    _: vk::Device,
++    buffer: vk::Buffer,
++    memory: vk::DeviceMemory,
++    offset: u64,
++) -> vk::Result {
++    DRIVER.with_borrow_mut(|d| {
++        let bytes = d.live[&memory.as_raw()].0;
++        let (size, bound) = d.buffers.get_mut(&buffer.as_raw()).unwrap();
++        assert!(bound.is_none() && offset <= bytes && *size <= bytes - offset);
++        *bound = Some(memory.as_raw());
++    });
++    vk::Result::SUCCESS
++}
++
++unsafe extern "system" fn buffer_address(
++    _: vk::Device,
++    info: *const vk::BufferDeviceAddressInfo<'_>,
++) -> u64 {
++    // SAFETY: ash passes a live address query.
++    let buffer = unsafe { (*info).buffer };
++    DRIVER.with_borrow(|d| {
++        let memory = d.buffers[&buffer.as_raw()]
++            .1
++            .expect("address after binding");
++        0x110000000 + memory * 256 * MIB
++    })
++}
++
++struct Allocator {
++    device: ash::Device,
++    memory: Mutex<Memory>,
++}
++
++impl Allocator {
++    fn new(types: &[(vk::MemoryPropertyFlags, u32)], addressed: bool) -> Self {
++        Self::with_heap_sizes(types, addressed, &[])
++    }
++
++    fn with_heap_sizes(
++        types: &[(vk::MemoryPropertyFlags, u32)],
++        addressed: bool,
++        heaps: &[u64],
++    ) -> Self {
++        let mut properties = vk::PhysicalDeviceMemoryProperties {
++            memory_type_count: types.len() as u32,
++            memory_heap_count: heaps.len() as u32,
++            ..Default::default()
++        };
++        for (out, &size) in properties.memory_heaps.iter_mut().zip(heaps) {
++            *out = vk::MemoryHeap {
++                size,
++                flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
++            };
++        }
++        for (out, &(property_flags, heap_index)) in properties.memory_types.iter_mut().zip(types) {
++            *out = vk::MemoryType {
++                property_flags,
++                heap_index,
++            };
++        }
++        DRIVER.with_borrow_mut(|d| {
++            assert!(d.live.is_empty() && d.buffers.is_empty());
++            *d = Driver {
++                type_heaps: types.iter().map(|(_, heap)| *heap as usize).collect(),
++                ..Driver::default()
++            };
++            for (out, &size) in d.heaps.iter_mut().zip(heaps) {
++                *out = size;
++            }
++        });
++        // SAFETY: only these recording entry points are reached; none submits GPU work.
++        let device = unsafe {
++            ash::Device::load_with(
++                |name| match name.to_bytes() {
++                    b"vkAllocateMemory" => allocate as vk::PFN_vkAllocateMemory as *const c_void,
++                    b"vkFreeMemory" => free as vk::PFN_vkFreeMemory as *const c_void,
++                    b"vkCreateBuffer" => create_buffer as vk::PFN_vkCreateBuffer as *const c_void,
++                    b"vkDestroyBuffer" => {
++                        destroy_buffer as vk::PFN_vkDestroyBuffer as *const c_void
++                    }
++                    b"vkGetBufferMemoryRequirements" => {
++                        buffer_requirements as vk::PFN_vkGetBufferMemoryRequirements
++                            as *const c_void
++                    }
++                    b"vkBindBufferMemory" => {
++                        bind_buffer as vk::PFN_vkBindBufferMemory as *const c_void
++                    }
++                    b"vkGetBufferDeviceAddress" => {
++                        buffer_address as vk::PFN_vkGetBufferDeviceAddress as *const c_void
++                    }
++                    _ => std::ptr::null(),
++                },
++                vk::Device::from_raw(1),
++            )
++        };
++        Self {
++            device,
++            memory: Mutex::new(Memory::new(
++                &properties,
++                64 * MIB,
++                addressed,
++                true,
++                vec![0],
++                None,
++                None,
++            )),
++        }
++    }
++
++    fn buffer(&self, bytes: u64, types: u32) -> Result<memory::Placement, Error> {
++        memory::allocate(
++            &self.memory,
++            &self.device,
++            &requirements(bytes, types),
++            MemoryClass::Private,
++        )
++    }
++}
++
++impl Drop for Allocator {
++    fn drop(&mut self) {
++        // This table has no queue; all allocations are idle at teardown.
++        // A negative baseline assertion may have poisoned the test's lock.
++        // Teardown still owns the table exclusively and must not panic again.
++        drop(
++            self.memory
++                .get_mut()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .destroy(&self.device),
++        );
++        DRIVER.with_borrow(|d| assert!(d.live.is_empty() && d.buffers.is_empty()));
++    }
++}
++
++fn requirements(size: u64, memory_type_bits: u32) -> vk::MemoryRequirements {
++    vk::MemoryRequirements {
++        size,
++        alignment: 256,
++        memory_type_bits,
++    }
++}
++
++#[test]
++fn speculative_blocks_follow_the_advertised_heap_not_system_ram() {
++    for (heap_mib, block_mib) in [(128, 8), (256, 16), (512, 32), (1280, 64)] {
++        let a = Allocator::with_heap_sizes(
++            &[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)],
++            false,
++            &[heap_mib * MIB],
++        );
++        for _ in 0..10 {
++            a.buffer(block_mib * MIB / 2, 1).unwrap();
++        }
++        DRIVER.with_borrow(|d| {
++            assert_eq!(
++                d.attempts.iter().map(|(bytes, _)| *bytes).max(),
++                Some(block_mib * MIB)
++            );
++        });
++    }
++}
++
++#[test]
++fn pooled_growth_oom_still_tries_the_resources_exact_size() {
++    let a = Allocator::new(&[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)], false);
++    let _first = a.buffer(32 * MIB, 1).unwrap();
++    let _second = a.buffer(32 * MIB, 1).unwrap();
++    DRIVER.with_borrow_mut(|d| d.largest = 29_593_600);
++    let small = a
++        .buffer(5 * MIB, 1)
++        .expect("a 5MiB resource fits even when 64MiB growth does not");
++    assert_eq!(small.size(), 5 * MIB);
++    assert_eq!(small.offset, 0);
++    DRIVER.with_borrow(|d| {
++        assert_eq!(&d.attempts[2..], &[(64 * MIB, 0), (5 * MIB, 0)]);
++        assert_eq!(d.live[&small.memory.as_raw()].0, 5 * MIB);
++    });
++    a.memory.lock().unwrap().free(&a.device, &small);
++    DRIVER.with_borrow(|d| assert!(!d.live.contains_key(&small.memory.as_raw())));
++}
++
++#[test]
++fn an_exact_image_block_is_not_recorded_as_the_failed_growth_size() {
++    let a = Allocator::new(&[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)], false);
++    let image = |size| {
++        memory::allocate_image(
++            &a.memory,
++            &a.device,
++            &requirements(size, 1),
++            MemoryClass::Private,
++        )
++    };
++    let _first = image(32 * MIB).unwrap();
++    let _second = image(32 * MIB).unwrap();
++    DRIVER.with_borrow_mut(|d| d.largest = 12_697_600);
++    let small = image(5_750_784).unwrap();
++    let census = a.memory.lock().unwrap().census();
++    assert_eq!(census.pooled_bytes, 64 * MIB);
++    assert_eq!(census.dedicated_bytes, 5_750_784);
++    a.memory.lock().unwrap().free(&a.device, &small);
++    let another = image(6_070_272).unwrap();
++    assert_ne!(
++        another.memory, small.memory,
++        "a smaller spare cannot hold a larger resource"
++    );
++}
++
++#[test]
++fn pressure_reclaims_other_types_on_the_same_heap_but_no_live_or_foreign_block() {
++    let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
++    let a = Allocator::new(&[(flags, 0), (flags, 0), (flags, 1)], false);
++    DRIVER.with_borrow_mut(|d| d.heaps[0] = 20 * MIB);
++    let live = a.buffer(8 * MIB, 1).unwrap();
++    let idle = a.buffer(8 * MIB, 2).unwrap();
++    let foreign = a.buffer(8 * MIB, 4).unwrap();
++    {
++        let mut memory = a.memory.lock().unwrap();
++        memory.free(&a.device, &idle);
++        memory.free(&a.device, &foreign);
++    }
++    let _needed = a
++        .buffer(8 * MIB, 1)
++        .expect("same-heap idle allocation must give way");
++    DRIVER.with_borrow(|d| {
++        assert_eq!(d.freed, [idle.memory.as_raw()]);
++        assert!(d.live.contains_key(&live.memory.as_raw()));
++        assert!(d.live.contains_key(&foreign.memory.as_raw()));
++    });
++}
++
++#[test]
++fn a_host_import_can_reclaim_idle_pooled_memory_on_its_heap() {
++    #[repr(align(4096))]
++    struct Pages([u8; 8192]);
++    let mut pages = Box::new(Pages([0; 8192]));
++    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
++    let a = Allocator::new(
++        &[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0), (host, 0)],
++        false,
++    );
++    DRIVER.with_borrow_mut(|d| d.heaps[0] = 8 * MIB);
++    let idle = a.buffer(8 * MIB, 1).unwrap();
++    let mut memory = a.memory.lock().unwrap();
++    memory.free(&a.device, &idle);
++    // SAFETY: aligned, owned pages stay alive until the import is freed below.
++    let imported = unsafe {
++        memory.import_host(
++            &a.device,
++            (NonNull::new(pages.0.as_mut_ptr()).unwrap(), None),
++            8192,
++            2,
++            MemoryClass::Shared,
++        )
++    }
++    .expect("an import participates in the same heap's pressure reclamation");
++    assert_eq!(imported.mapped.unwrap().as_ptr(), pages.0.as_mut_ptr());
++    DRIVER.with_borrow(|d| assert_eq!(d.freed, [idle.memory.as_raw()]));
++    memory.free(&a.device, &imported);
++}
++
++#[test]
++fn exact_failure_stays_oom_and_a_dedicated_request_is_not_retried_without_reclaim() {
++    let a = Allocator::new(&[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)], false);
++    let _first = a.buffer(32 * MIB, 1).unwrap();
++    let _second = a.buffer(32 * MIB, 1).unwrap();
++    DRIVER.with_borrow_mut(|d| d.largest = MIB);
++    assert!(matches!(
++        a.buffer(2 * MIB, 1),
++        Err(Error::OutOfMemory(MemoryKind::Device))
++    ));
++    assert!(matches!(
++        a.buffer(40 * MIB, 1),
++        Err(Error::OutOfMemory(MemoryKind::Device))
++    ));
++    DRIVER.with_borrow(|d| {
++        assert_eq!(
++            &d.attempts[2..],
++            &[(64 * MIB, 0), (2 * MIB, 0), (40 * MIB, 0)]
++        );
++        assert_eq!(d.live.len(), 2);
++    });
++}
++
++#[test]
++fn device_loss_is_not_retried_as_allocation_pressure() {
++    let a = Allocator::new(&[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)], false);
++    DRIVER.with_borrow_mut(|d| d.fail_next = Some(vk::Result::ERROR_DEVICE_LOST));
++    assert!(matches!(a.buffer(4096, 1), Err(Error::DeviceLost)));
++    DRIVER.with_borrow(|d| assert_eq!(d.attempts, [(4 * MIB, 0)]));
++}
++
++#[test]
++fn addressed_fallback_releases_failed_buffers_and_binds_only_actual_capacity() {
++    let a = Allocator::new(&[(vk::MemoryPropertyFlags::DEVICE_LOCAL, 0)], true);
++    let counts = Counters::default();
++    let addressed = |size| {
++        memory::allocate_addressed(
++            &a.memory,
++            &a.device,
++            &requirements(size, 1),
++            MemoryClass::Private,
++            &counts,
++        )
++    };
++    let _first = addressed(32 * MIB).unwrap();
++    let _second = addressed(32 * MIB).unwrap();
++    DRIVER.with_borrow_mut(|d| d.largest = 12_697_600);
++    let small = addressed(4096).unwrap();
++    assert!(small.address.unwrap() > u64::from(u32::MAX));
++    DRIVER.with_borrow(|d| assert_eq!(d.buffers.len(), 3));
++    a.memory.lock().unwrap().free(&a.device, &small);
++    DRIVER.with_borrow(|d| {
++        assert_eq!(d.buffers.len(), 2);
++        assert_eq!(d.live.len(), 2);
++    });
++}
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2373,6 +2373,11 @@
+         Ok(())
+     }
+ 
++    /// Bounded diagnostic stages of this shared command state. No Metal counterpart.
++    pub fn stage_summary(&self) -> [u64; 12] {
++        crate::stage_trace::command_summary(Arc::as_ptr(&self.0) as u64)
++    }
++
+     /// `commit`: hand the batches to the device's scheduler, which submits them in the queue's
+     /// commit order, each once the events it waits for are reached. It returns at once, as
+     /// Metal's does: the scheduler's thread makes every submission, so no driver call holds it
+@@ -2404,11 +2409,6 @@
+     /// ([`CommandBufferError::CallRefused`] of `commit`, where no call of it was refused before;
+     /// [`refusal`](Self::refusal) keeps the error): it completes in its queue's order, its
+     /// completed handlers run.
+-    /// Bounded diagnostic stages of this actual shared command state.
+-    pub fn stage_summary(&self) -> [u64; 12] {
+-        crate::stage_trace::command_summary(Arc::as_ptr(&self.0) as u64)
+-    }
+-
+     pub fn commit(&self) -> Result<(), Error> {
+         self.commit_as("commit", None)
+     }
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -181,6 +181,12 @@
+ 
+ ## The memory model
+ 
++- **Allocation pressure.** Pool growth is bounded by the advertised GPU heaps (at most one
++  sixteenth of the smallest usable heap and 64 MiB). If growth fails, idle blocks on that heap
++  are released and the resource can take an exact-size dedicated block. Host imports also release
++  idle blocks on their heap before a bounded retry. Live resources keep their memory; a required
++  allocation that still fails reports the real error. Bounded pressure records distinguish the
++  resource's size from speculative growth and report retained allocator bytes.
+ - **Storage modes** keep Metal's meaning. `DeviceProperties::has_unified_memory` answers from the
+   device type: yes for an integrated GPU or a CPU implementation, no for a discrete GPU. Without
+   unified memory a `Managed` buffer has two copies, as on a Mac with a discrete GPU
+--- a/crates/metal2vulkan/src/cache/mod.rs
++++ b/crates/metal2vulkan/src/cache/mod.rs
+@@ -93,7 +93,7 @@
+ /// changes no behaviour, and then updates that hash alone with the commit saying why, or changes
+ /// behaviour and also bumps this version. The commit that bumps it says what changed; this comment
+ /// keeps no history.
+-pub const RUNTIME_VERSION: u32 = 1694;
++pub const RUNTIME_VERSION: u32 = 1695;
+ 
+ /// The digest of the sources this build of the crate was compiled from: SHA-256, as lowercase hex,
+ /// of the manifest, the build script, and exactly the files the crate roots' module tree compiles

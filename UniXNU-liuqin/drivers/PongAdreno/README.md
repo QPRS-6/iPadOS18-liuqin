@@ -20,6 +20,84 @@ Pong 专属实现，不来自 `UniXNU/Adreno740`（那是 740 的固件与寄存
 
 ## Sheng activation chain / Pong20G81
 
+## liuqin / 22H374 GPU client scopes
+
+### services66：导入图像的GMEM边界
+
+`0066-pong-imported-gmem-edges.patch` 为当前Mesa26.2.6补上
+`InPlaceWrites` 所需的线性host-import边界处理。显式布局/host指针导入的纹理，
+尺寸不是GMEM块的整数倍时，使用已有的精确texel加载、存储路径；
+`tu_choose_gmem_layout` 同时保留这些存储所需的CCU区域。像素格式、交换和采样
+继续使用这些路径原有的计算。无需更改kernel ABI、地址窗口或时钟。
+
+`tests/turnip-imported-gmem.py` 执行实际load/store/layout函数：128组输入，
+旧源在24组紧凑导入输入的三个决策点均错误，新源全部通过ASan/UBSan；
+条件/强制加载和调试路径也覆盖。Mesa完整iOS交叉构建通过，GPU像素仍需实机观察。
+
+### services64：可选36位地址空间
+
+机主64-36日志已经记录高地址CP写入正确的 `0x73640036` 和完成的fence2，
+但64的探测调用将4字节传给要求整4KiB页的 `acquireDeviceWrites`，因此返回
+`0xe00002c2` 并阻断GPU发布。services65改为同步完整目标页，增加该步骤的
+状态记录；真实提交/fence/缓存失败及结果不匹配仍保持失败。回归同时运行
+实际探测主体和实际内存接口，重现旧误判并验证修正及失败路径。
+
+65-36实机已确认整页同步成功、探测PASS、GPU服务和256MiB租约生效；
+图形异常及该窗口内OOM仍然存在，记录于 `logs/pong/services65/device-observation.json`。
+
+`gpuva=32`（默认）使用原4GiB GPU地址范围、16连接和128MiB次要窗口。
+`gpuva=36` 选择原生4KiB页表的16GiB范围，32个连接槽，次要窗口256MiB。
+backboardd1280MiB、SpringBoard512MiB仍使用原低地址范围。窗口是地址范围，
+物理页按实际资源分配。
+
+新窗口从 `0x110000000` 开始；`0x100000000` 的8KiB保留映射用于启动验证。
+GPU必须通过真实CP高地址IB读取、MEM_WRITE、fence和CPU结果检查，才发布服务。
+失败或前提缺失记录FAIL/SKIP并保留资源。该检查只验证CP高地址基本访问，
+完整着色器/显示表现需要真机测试。32位对照保留原窗口布局。
+
+`PongGpuVaPolicy.h` 给出有界页表容量：低36/16GiB共8209页页表，约32MiB。
+TBI策略仅允许未标记的低32/低36地址，映射入口仍严格限制范围；上区间、其他宽度
+和寄存器不一致继续拒绝。GMU自己的32位配置与SID、固件和电源流程沿用既有实现。
+`tests/gpu-wide-va.py` 验证实际页表/上下文编码、高地址翻译、窗口与CP包字段，
+直接MMIO绑定仍只在AArch64内核构建。设备结果另行记录。
+
+Turnip的Darwin后端由本仓库 `turnip/` 维护，按连接、设备状态、同步和Mesa适配
+重写为独立模块，构建器将源码放入Mesa。每个逻辑设备拥有自己的连接、VA/fence和
+回收记录；临时探测、其他设备关闭和host-sync导出并发不会互相接管状态。
+锁契约、失败处理和测试入口见 [turnip/README.md](turnip/README.md)。
+
+ABI1 uses one 32-bit GPU aperture. The established backboardd1280MiB and
+SpringBoard512MiB windows are retained; fourteen secondary connection slots
+each receive a disjoint128MiB window. These are virtual-address scopes, not
+wired memory reservations. The final free slot has its own range even when
+all earlier slots are occupied. The prior variable poster-first leases could
+consume the entire aperture before Freeform opened (`57.txt`: slot15 mount
+NoSpace, followed by a nil-compute-function assertion).
+
+Successful global retirement and resource teardown remain prerequisites for
+reusing a slot. Failed close logs its process/slot/status and retains live
+maps; no forced unmap, live relocation or GPU reset is added. Larger poster
+workloads may still exhaust their128MiB scope: that is not hidden by claiming
+more GPU address space. The frontend separately bounds optional cache holds
+and retries refused imports once after safe cache eviction.
+
+`tests/native-adreno-windows.cpp` checks all sixteen scopes, bounds,
+non-overlap and unchanged UI reservations. This host test proves the address
+policy, not app rendering. Later device observations are recorded below.
+
+Owner61 `mid3.txt` reaches the16-connection cap24times, including Freeform's
+first launch. A later Freeform process opens slot7 but reports private texture
+and IOSurface import OOM in its128MiB scope. No failed-close record is present;
+this is not evidence of a leaked or safely reclaimable live connection.
+
+The Turnip consumer now uses the lease returned by the actual device open
+when constructing its VMA (`patches/mesa/0062-pong-active-device-lease.patch`).
+The temporary enumeration connection does not own its range after close.
+`0063-pong-allocation-failure-evidence.patch` records allocation stage/native
+status, free/largest VA extent and raw device-loss causes. These changes do
+not establish that every graphics failure was a stale lease; current scope
+capacity and the shared32-bit context remain separate limitations.
+
 Pong uses Nothing's SM8475 bootstrap ordering: CP initialization packets,
 real RPTR drain plus RBBM idle, authenticated ZAP, an unfenced nonsecure
 switch, then a real CP memory write and timestamp fence. Sheng's ordinary

@@ -9,6 +9,10 @@ Nothing Phone (2)（Pong / Qualcomm SM8475）的 UniXNU 格式 2 设备仓库。
 - 官方说明：[仓库迁移](https://unixnu.com/zh/porting/migration)、[设备仓库](https://unixnu.com/zh/porting/device-repository)、[驱动适配](https://unixnu.com/zh/porting/drivers)
 - 本设备：[格式 2 配置与构建](migration/format2/README.zh.md)、[系统迁移](migration/ipados18/README.zh.md)、[结构化移植记录](porting.toml)
 
+> **构建前先自检**：本仓库只含自研代码与补丁，Apple 源码、IPSW、SDK、固件和 OS 镜像均为本地输入。
+> 新机器请先运行 `python3 scripts/check-inputs.py`，缺失项会列出获取方法；完整清单见
+> [docs/INPUTS.zh.md](docs/INPUTS.zh.md)。
+
 ## 设备与进度
 
 | 部分 | Pong 配置及实际进度 |

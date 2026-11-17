@@ -1,0 +1,17 @@
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5808,6 +5808,12 @@
+ 	 * The caller holds the thread and pset locks, as for the native search. */
+-	extern uint64_t pong_cpu_preferred_idle_mask(uint64_t available);
++	extern uint64_t pong_cpu_preferred_idle_class(uint64_t available, unsigned demand);
+ 	if (thread->bound_processor == PROCESSOR_NULL && thread->sched_pri < BASEPRI_RTQUEUES) {
+ 		uint64_t available = pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask;
+-		uint64_t preferred = pong_cpu_preferred_idle_mask(available) & available;
++		unsigned qos = MAX(thread->effective_policy.thep_qos, thread->effective_policy.thep_qos_promote);
++		unsigned demand = 1;
++		if (qos >= THREAD_QOS_MAINTENANCE && qos <= THREAD_QOS_UTILITY) demand = 0;
++		if (qos >= THREAD_QOS_USER_INITIATED || thread->sched_pri >= BASEPRI_KERNEL) demand = 2;
++		/* The board's default retains the old ranking; cpuq=1 uses observed
++		 * core kinds and demand without changing RT, binding or queue order. */
++		uint64_t preferred = pong_cpu_preferred_idle_class(available, demand) & available;
+ 		int cpu = lsb_next(preferred, pset->cpu_preferred_last_chosen);

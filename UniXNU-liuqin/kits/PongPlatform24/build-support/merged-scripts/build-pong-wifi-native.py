@@ -19,7 +19,7 @@ def main():
  if a.ath11k is None:a.ath11k=a.tree/'build/pong-ath11k/libPongAth11k.a'
  shared=input_path('wifi_shared')
  if not a.ath11k.is_file():raise RuntimeError('Build the matching Pong ath11k archive first: '+str(a.ath11k))
- profile=json.loads((ROOT/'configs/pong-wifi-sm8475.json').read_text())
+ profile=json.loads(Path(os.environ.get('PONG_WIFI_PROFILE',ROOT/'configs/pong-wifi-sm8475.json')).read_text())
  if profile['soc']!='SM8475' or profile['pci']['device']!=0x1103:raise RuntimeError('Pong QCA6490 profile required')
  hardware=os.environ.get('PONG_HARDWARE_DTB')
  if hardware:
@@ -67,7 +67,9 @@ def main():
  provenance_path=a.firmware.parent/'local-inputs.json'
  provenance=json.loads(provenance_path.read_text())
  source=provenance.get('source',{})
- if (source.get('product','').lower()!='pong' or source.get('capture')!='REC read-only active modem'
+ official=(profile.get('board')=='liuqin' and provenance.get('source_kind')=='owner-confirmed liuqin official firmware package'
+           and provenance.get('version')=='OS3.0.7.0.VMYCNXM' and provenance.get('original_modified') is False)
+ if not official and (source.get('product','').lower()!='pong' or source.get('capture')!='REC read-only active modem'
      or source.get('slot') not in ('_a','_b')
      or source.get('partition')!='/dev/block/by-name/modem'+source['slot']
      or Path(provenance['firmware_directory']).resolve()!=a.firmware.resolve()):

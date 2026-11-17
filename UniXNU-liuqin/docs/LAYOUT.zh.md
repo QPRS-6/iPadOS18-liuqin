@@ -95,6 +95,7 @@ UniXNU-liuqin/
 ├── userland/                   init、UI 适配、build-ipados18.py、touch.c
 ├── docs/
 │   ├── BUILD.zh.md             编译指南
+│   ├── INPUTS.zh.md            外部输入清单（新机器先看这个）
 │   ├── LAYOUT.zh.md            本文
 │   └── USB-LOGGING-PLAN.zh.md  USB 控制台计划
 ├── migration/format2/          SM8475 设备种子
@@ -108,6 +109,7 @@ UniXNU-liuqin/
 
 | 脚本 | 作用 |
 |---|---|
+| `scripts/check-inputs.py` | 自检所有外部输入并在缺失时给出获取方法（新机器第一步） |
 | `scripts/build-pong-turnip.py` | 交叉编译 Turnip（`libvulkan_freedreno.dylib`） |
 | `scripts/build-pong-metal-bridge.py` | 编译 `PongMetalBridge.dylib`（Metal→Vulkan 前端） |
 | `scripts/build-pong-metal-plugin.py` | 组装 `PongAdrenoMetal.bundle`（插件 + bridge + Turnip） |

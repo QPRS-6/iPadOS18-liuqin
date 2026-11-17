@@ -1,0 +1,93 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -148,6 +148,58 @@
+ 
+ void panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss) __abortlike;
+ 
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++/*
++ * Bounded user-fault records.  Printing from the exception path deadlocked the
++ * kernel log lock on this port (spinlock timeout panic at the first user fault),
++ * so the handler only appends to a static array; the record is flushed later
++ * from the exiting process' own thread, where printing is safe.
++ */
++#define PONG_USER_FAULT_SLOTS 16
++struct pong_user_fault_record {
++	int      pid;
++	uint64_t pc, lr, far, esr;
++};
++static struct pong_user_fault_record pong_user_fault_records[PONG_USER_FAULT_SLOTS];
++static unsigned pong_user_fault_count;
++
++void
++pong_user_fault_note(int pid, uint64_t pc, uint64_t lr, uint64_t far, uint64_t esr)
++{
++	unsigned slot = __atomic_fetch_add(&pong_user_fault_count, 1u, __ATOMIC_RELAXED);
++
++	if (slot >= PONG_USER_FAULT_SLOTS) {
++		return;
++	}
++	pong_user_fault_records[slot].pid = pid;
++	pong_user_fault_records[slot].pc  = pc;
++	pong_user_fault_records[slot].lr  = lr;
++	pong_user_fault_records[slot].far = far;
++	pong_user_fault_records[slot].esr = esr;
++}
++
++void
++pong_user_fault_dump(int pid)
++{
++	unsigned i, n = __atomic_load_n(&pong_user_fault_count, __ATOMIC_RELAXED);
++
++	if (n > PONG_USER_FAULT_SLOTS) {
++		n = PONG_USER_FAULT_SLOTS;
++	}
++	for (i = 0; i < n; i++) {
++		if (pong_user_fault_records[i].pid != pid) {
++			continue;
++		}
++		printf("PONG UFAULT pid=%d pc=%#llx lr=%#llx far=%#llx esr=%#llx\n",
++		    pid,
++		    (unsigned long long)pong_user_fault_records[i].pc,
++		    (unsigned long long)pong_user_fault_records[i].lr,
++		    (unsigned long long)pong_user_fault_records[i].far,
++		    (unsigned long long)pong_user_fault_records[i].esr);
++	}
++}
++#endif
++
+ void sleh_synchronous_sp1(arm_context_t *, uint64_t, vm_offset_t) __abortlike;
+ void sleh_synchronous(arm_context_t *, uint64_t, vm_offset_t, bool);
+ 
+@@ -726,6 +778,15 @@
+ 	}
+ #endif
+ 	bool is_user = PSR64_IS_USER(get_saved_state_cpsr(state));
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++	if (is_user && (class == ESR_EC_DABORT_EL0 || class == ESR_EC_IABORT_EL0)) {
++		struct proc *fault_proc = get_bsdtask_info(get_threadtask(thread));
++		pong_user_fault_note(fault_proc ? proc_pid(fault_proc) : -1,
++		    (uint64_t)get_saved_state_pc(state), (uint64_t)get_saved_state_lr(state),
++		    (uint64_t)far, (uint64_t)esr);
++	}
++#endif
+ #if defined(PONG) && (DEVELOPMENT || DEBUG)
+ 	/* Bounded PID 1 records: no stack walks, user copies, registry or MMIO. */
+ 	static unsigned pong_init_faults, pong_init_svcs;
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1562,6 +1562,13 @@
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++	{
++		extern void pong_user_fault_dump(int pid);
++		pong_user_fault_dump(proc_getpid(p));
++	}
++#endif
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.

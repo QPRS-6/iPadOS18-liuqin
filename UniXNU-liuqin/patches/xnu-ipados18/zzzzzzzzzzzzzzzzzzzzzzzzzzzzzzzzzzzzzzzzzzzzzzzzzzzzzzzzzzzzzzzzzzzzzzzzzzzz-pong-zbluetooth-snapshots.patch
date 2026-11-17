@@ -1,0 +1,9 @@
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1079,4 +1079,6 @@
+ 	extern void pong_native_input_panic_dump(void) __attribute__((weak));
+ 	if (pong_native_input_panic_dump != NULL) pong_native_input_panic_dump();
++	extern void pong_bluetooth_panic_dump(void) __attribute__((weak));
++	if (pong_bluetooth_panic_dump != NULL) pong_bluetooth_panic_dump();
+ 	printf("PONG last qsort n=%lu es=%lu cmp=%p lr=%p\n",
+ 	    pong_qsort_last_n, pong_qsort_last_es, (void *)pong_qsort_last_cmp,

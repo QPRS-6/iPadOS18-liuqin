@@ -16,6 +16,7 @@ def input_path(name):
     variables = {
         'sheng_source': ('PONG_SHENG_ROOT', 'UNIXNU_SHENG_ROOT'),
         'wifi_shared': ('PONG_WIFI_SHARED',),
+        'bluetooth_shared': ('PONG_BLUETOOTH_SHARED',),
         'wifi_linux': ('PONG_WIFI_SOURCE',),
         'wifi_firmware': ('PONG_WIFI_FIRMWARE',),
         'audio_container': ('PONG_AUDIO_CONTAINER',),
@@ -24,6 +25,7 @@ def input_path(name):
     defaults = {
         'sheng_source': ROOT / 'refer/ipados18/UniXNU-sheng',
         'wifi_shared': ROOT / 'refer/ipados18/Ath12kWifi',
+        'bluetooth_shared': ROOT / 'refer/ipados18/QcaBluetooth',
         'wifi_linux': ROOT / 'refer/ipados18/linux-7.0.14',
         'wifi_firmware': ROOT / 'out/ipados18/firmware/qca6490',
         'audio_container': ROOT / 'out/ipados18/firmware/audio/tfa98xx.cnt',

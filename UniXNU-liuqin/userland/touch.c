@@ -1,5 +1,5 @@
-/* Pong touch-to-HID bridge.
- * Runs in backboardd, reads only actual Goodix samples. No graphics hooks. */
+/* Pong input-to-HID bridge. Reads only actual hardware source queues.
+ * Native Novatek pen reports use a separate standard HID stylus device. */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -17,8 +17,11 @@
 #include <signal.h>
 #include <limits.h>
 #include "touch.h"
+#include "../drivers/PongInputNative/PongNativePenABI.h"
+#include "PongPenEvent.h"
 #define say(...) fprintf(stderr,__VA_ARGS__)
-/* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
+/* IOKit's HID event system; digitizer/polar signatures cross-checked against
+ * WebKit's iOS IOKitSPIIOS.h and the iPhoneOS18.6 symbol catalog. */
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
@@ -45,7 +48,9 @@ static Boolean (*IOHIDVirtualServiceClientRemove)(IOHIDServiceClientRef service)
 static Boolean (*IOHIDVirtualServiceClientDispatchEvent)(IOHIDServiceClientRef service, IOHIDEventRef event);
 static IOHIDEventRef (*IOHIDEventCreateDigitizerEvent)(CFAllocatorRef allocator, uint64_t time, uint32_t transducer, uint32_t index,
     uint32_t identity, uint32_t event_mask, uint32_t button_mask, double x, double y, double z, double tip_pressure,
-    double barrel_pressure, double twist, Boolean range, Boolean touch, uint32_t options);
+    double barrel_pressure, uint32_t range, uint32_t touch, uint32_t options);
+static IOHIDEventRef (*IOHIDEventCreateDigitizerStylusEventWithPolarOrientation)(CFAllocatorRef,uint64_t,uint32_t,uint32_t,
+    uint32_t,uint32_t,double,double,double,double,double,double,double,double,uint32_t,uint32_t,uint32_t);
 static IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef allocator, uint64_t time, uint32_t index, uint32_t identity,
     uint32_t event_mask, double x, double y, double z, double tip_pressure, double twist, Boolean range, Boolean touch,
     uint32_t options);
@@ -89,6 +94,22 @@ static struct {
 	bool touching, edge;
 	double x, y;
 } fingers[MAX_FINGERS];
+
+/* A single display-integrated collection carries fingers and the real stylus.
+ * Serialize handoff and retain the screen while the pen reader uses it. */
+static pthread_mutex_t screen_lock=PTHREAD_MUTEX_INITIALIZER;
+static IOHIDServiceClientRef main_screen;
+static bool screen_pen_range;
+
+static IOHIDServiceClientRef
+copy_main_screen(void)
+{
+    pthread_mutex_lock(&screen_lock);
+    IOHIDServiceClientRef screen=main_screen;
+    if(screen)CFRetain(screen);
+    pthread_mutex_unlock(&screen_lock);
+    return screen;
+}
 
 static CFNumberRef
 number(int value)
@@ -137,10 +158,7 @@ service_set_property(__attribute__((unused)) void *target, void *refcon, __attri
 		int mode = 0;
 
 		CFNumberGetValue(value, kCFNumberIntType, &mode);
-		if (mode != __atomic_load_n(&touch_mode,__ATOMIC_RELAXED)) {
-			say("Pong touch HID: touch detection mode %#x\n", mode);
-		}
-		__atomic_store_n(&touch_mode,mode,__ATOMIC_RELAXED);
+        __atomic_store_n(&touch_mode,mode,__ATOMIC_RELAXED);
 	}
 	return true;
 }
@@ -201,7 +219,8 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	}
 	/* the dictionary stays: it is what service_copy_property() answers from */
 	made->properties = properties;
-	made->display = display;
+    /* Pen services must not overwrite the main-screen touch/wake policy. */
+    made->display = display && usage == HID_USAGE_TOUCH_SCREEN;
 	CFRelease(pair);CFRelease(pairs);CFRelease(name);
 	CFRelease(page_number);CFRelease(usage_number);CFRelease(zero);
 	for (int attempt = 1; attempt <= 20; attempt++) {
@@ -247,8 +266,8 @@ send_touch(IOHIDServiceClientRef screen, const struct pong_touch *t)
 		any |= fingers[i].touching;
 	}
 
-	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
-	    fingers[f].y, 0, 0, 0, 0, any, any, 0);
+    hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
+        fingers[f].y, 0, 0, 0, any, any, 0);
     if (!hand) return;
 	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
 	IOHIDEventSetIntegerValue(hand, FIELD_IS_BUILT_IN, 1);
@@ -316,20 +335,20 @@ input_thread(void *unused)
         client=IOHIDEventSystemClientCreateWithType(NULL,types[i],NULL);
         if (!client) continue;
         IOHIDEventSystemClientScheduleWithDispatchQueue(client,dispatch_queue_create("pong.touch.hid",NULL));
-        screen=make_service(client,"Pong Goodix Berlin-D",HID_PAGE_DIGITIZER,HID_USAGE_TOUCH_SCREEN,true);
+        screen=make_service(client,"Pong native touchscreen",HID_PAGE_DIGITIZER,HID_USAGE_TOUCH_SCREEN,true);
         if (!screen) CFRelease(client);
     }
     if (!screen) {say("Pong touch HID: server did not open digitizer; SKIP\n");close(device);return NULL;}
+    pthread_mutex_lock(&screen_lock);main_screen=(IOHIDServiceClientRef)CFRetain(screen);pthread_mutex_unlock(&screen_lock);
     if (IOHIDEventCreateKeyboardEvent)
         wake_control=make_service(client,"Pong touch wake control",HID_PAGE_CONSUMER,HID_USAGE_CONSUMER_CONTROL,false);
-    say("Pong touch HID: display-integrated digitizer opened\n");
-    if (wake_control) say("Pong touch HID: tap-to-wake consumer opened\n");
-    struct pong_touch sample;unsigned count=0,waking=0;ssize_t length;
+    struct pong_touch sample;unsigned waking=0;ssize_t length;
     while ((length=read(device,&sample,sizeof(sample)))>0 || (length<0 && errno==EINTR)) {
         if (length<0) continue;
         if (length!=(ssize_t)sizeof(sample) || sample.type<PONG_TOUCH_DOWN || sample.type>PONG_TOUCH_UP) continue;
         if (sample.finger>=MAX_FINGERS) continue;
-        if (count++<4) say("Pong touch HID: type=%u finger=%u xy=%u,%u\n",sample.type,sample.finger,sample.x,sample.y);
+        pthread_mutex_lock(&screen_lock);
+        if(screen_pen_range){if(sample.type==PONG_TOUCH_UP)waking&=~(1u<<sample.finger);pthread_mutex_unlock(&screen_lock);continue;}
         unsigned mode=(unsigned)__atomic_load_n(&touch_mode,__ATOMIC_RELAXED)&0xff;
         unsigned bit=1u<<sample.finger;
         if (mode==TOUCH_MODE_OFF || mode==TOUCH_MODE_WAKE) {
@@ -337,16 +356,117 @@ input_thread(void *unused)
             if (mode==TOUCH_MODE_WAKE && sample.type==PONG_TOUCH_DOWN && !waking)
                 tap_wake(wake_control,sample.time);
             if (sample.type==PONG_TOUCH_UP) waking&=~bit;else waking|=bit;
+            pthread_mutex_unlock(&screen_lock);
             continue;
         }
-        if (waking&bit) {if (sample.type==PONG_TOUCH_UP) waking&=~bit;continue;}
+        if (waking&bit) {if (sample.type==PONG_TOUCH_UP) waking&=~bit;pthread_mutex_unlock(&screen_lock);continue;}
         send_touch(screen,&sample);
+        pthread_mutex_unlock(&screen_lock);
     }
     /* Release outstanding contacts if the physical source goes away. */
+    pthread_mutex_lock(&screen_lock);
     release_contacts(screen,mach_absolute_time());
+    if(main_screen==screen){CFRelease(main_screen);main_screen=NULL;screen_pen_range=false;}
+    pthread_mutex_unlock(&screen_lock);
     if (wake_control) {IOHIDVirtualServiceClientRemove(wake_control);CFRelease(wake_control);}
     close(device);IOHIDVirtualServiceClientRemove(screen);CFRelease(screen);CFRelease(client);
     return NULL;
+}
+
+static int
+send_pen(IOHIDServiceClientRef service,const struct pong_native_pen *sample,const struct pong_native_pen *previous)
+{
+    if(!service)return -1;
+    const uint32_t mask=pong_pen_change_mask(sample,previous);
+    const double pressure=sample->pressure*500.0/4095.0;
+    double altitude=0,azimuth=0;
+    /* Same main-screen collection route that already delivers real fingers.
+     * Child type0 stays stylus; index11 cannot collide with fingers1..10. */
+    IOHIDEventRef event=NULL;
+    if(IOHIDEventCreateDigitizerStylusEventWithPolarOrientation && pong_pen_polar(sample,&altitude,&azimuth))
+        event=IOHIDEventCreateDigitizerStylusEventWithPolarOrientation(NULL,sample->time,11,1,mask,sample->touch?1u:0u,
+            sample->x/65535.0,sample->y/65535.0,0,pressure,0,0,altitude,azimuth,sample->range,0,sample->touch?0x20000u:0u);
+    else event=IOHIDEventCreateDigitizerEvent(NULL,sample->time,0,11,1,mask,sample->touch?1u:0u,
+        sample->x/65535.0,sample->y/65535.0,0,pressure,0,sample->range,sample->touch,0);
+    if(!event)return -1;
+    IOHIDEventRef collection=IOHIDEventCreateDigitizerEvent(NULL,sample->time,DIGITIZER_HAND,0,0,
+        mask&~DIGITIZER_RANGE,sample->touch?1u:0u,
+        sample->x/65535.0,sample->y/65535.0,0,0,0,sample->range,sample->touch,0);
+    if(!collection){CFRelease(event);return -1;}
+    IOHIDEventSetIntegerValue(event,FIELD_DIGITIZER_DISPLAY_INTEGRATED,1);
+    IOHIDEventSetIntegerValue(event,FIELD_IS_BUILT_IN,1);
+    IOHIDEventSetIntegerValue(collection,FIELD_DIGITIZER_DISPLAY_INTEGRATED,1);
+    IOHIDEventSetIntegerValue(collection,FIELD_IS_BUILT_IN,1);
+    IOHIDEventAppendEvent(collection,event,0);
+    Boolean sent=IOHIDVirtualServiceClientDispatchEvent(service,collection);CFRelease(event);CFRelease(collection);
+    return sent?0:-1;
+}
+
+static void *
+pen_thread(void *unused)
+{
+    (void)unused;pthread_setname_np("Pong native SPI pen");
+    int fd=-1;
+    for(unsigned i=0;i<60 && fd<0;i++){fd=open("/dev/pong-pen",O_RDONLY);if(fd<0)sleep(1);}
+    if(fd<0){say("Pong pen HID: native source unavailable; SKIP\n");return NULL;}
+    IOHIDServiceClientRef penService=NULL;
+    for(unsigned i=0;i<600 && !penService;i++) {
+        penService=copy_main_screen();if(!penService)usleep(100000);
+    }
+    if(!penService){say("Pong pen HID: main-screen service unavailable; SKIP\n");close(fd);return NULL;}
+    say("Pong pen HID: main-screen stylus collection, polarAPI=%u; real XY/pressure/tilt, application response still requires testing\n",
+        IOHIDEventCreateDigitizerStylusEventWithPolarOrientation!=NULL);
+    struct pong_native_pen sample,lastSent={0};ssize_t n;bool active=false,lastTouch=false,haveSent=false;
+    unsigned hover=0,tips=0,leaves=0,peak=0,errors=0,skipped=0;
+    unsigned hoverLogs=0,tipLogs=0,transitionLogs=0,errorLogs=0,invalidLogs=0;
+    uint64_t lastSummary=0;mach_timebase_info_data_t timebase={0};mach_timebase_info(&timebase);
+    while((n=read(fd,&sample,sizeof(sample)))>0 || (n<0 && errno==EINTR)) {
+        if(n<0)continue;
+        if(n!=(ssize_t)sizeof(sample) || sample.range>1 || sample.touch>1 || sample.x>65535 || sample.y>65535 ||
+            sample.pressure>4095 || (sample.touch && !sample.range)) {
+            if(invalidLogs++<8)say("Pong pen HID: rejected queue record bytes=%ld\n",(long)n);
+            continue;
+        }
+        pthread_mutex_lock(&screen_lock);
+        if(main_screen!=penService){pthread_mutex_unlock(&screen_lock);break;}
+        unsigned mode=(unsigned)__atomic_load_n(&touch_mode,__ATOMIC_RELAXED)&255;
+        if(mode==TOUCH_MODE_OFF || mode==TOUCH_MODE_WAKE) {
+            ++skipped;
+            if(active){struct pong_native_pen up={0};up.time=sample.time;up.x=sample.x;up.y=sample.y;
+                if(!send_pen(penService,&up,haveSent?&lastSent:NULL)){lastSent=up;haveSent=true;}active=false;lastTouch=false;}
+            screen_pen_range=false;
+            pthread_mutex_unlock(&screen_lock);
+            continue; // preserve physical screen-off, no pen-generated power event
+        }
+        if(sample.range && !screen_pen_range)release_contacts(penService,sample.time);
+        screen_pen_range=sample.range;
+        const bool transition=active!=!!sample.range || lastTouch!=!!sample.touch;
+        int result=send_pen(penService,&sample,haveSent?&lastSent:NULL);active=sample.range;lastTouch=sample.touch;
+        if(!result){lastSent=sample;haveSent=true;}
+        pthread_mutex_unlock(&screen_lock);
+        if(sample.touch)++tips;else if(sample.range)++hover;else ++leaves;
+        if(sample.pressure>peak)peak=sample.pressure;
+        if(result)++errors;
+        bool log=false;
+        if(sample.touch && tipLogs<8){++tipLogs;log=true;}
+        if(sample.range && !sample.touch && hoverLogs<2){++hoverLogs;log=true;}
+        if(transition && transitionLogs<20){++transitionLogs;log=true;}
+        if(result && errorLogs<8){++errorLogs;log=true;}
+        if(log)say("Pong pen HID: phase=%s range=%u touch=%u tipButton=%u pressure=%u hidPressure=%.3f tilt=%d/%d tiltValid=%u dispatch=%#x route=main-screen-collection\n",
+            sample.touch?"tip":sample.range?"hover":"leave",sample.range,sample.touch,sample.touch?1u:0u,
+            sample.pressure,sample.pressure*500.0/4095.0,sample.tiltX,sample.tiltY,!!(sample.reserved&PONG_PEN_TILT_VALID),result);
+        if(!lastSummary || (timebase.numer && sample.time>lastSummary &&
+           sample.time-lastSummary>=(UINT64_C(10000000000)*timebase.denom)/timebase.numer)) {
+            say("Pong pen HID: totals hover=%u tip=%u leave=%u peak=%u dispatchErrors=%u screenOffSkipped=%u\n",hover,tips,leaves,peak,errors,skipped);
+            lastSummary=sample.time;
+        }
+    }
+    pthread_mutex_lock(&screen_lock);
+    if(active && main_screen==penService){struct pong_native_pen up={0};up.time=mach_absolute_time();up.x=sample.x;up.y=sample.y;send_pen(penService,&up,haveSent?&lastSent:NULL);}
+    screen_pen_range=false;
+    pthread_mutex_unlock(&screen_lock);
+    if(penService)CFRelease(penService); // borrowed screen is removed only by its owner
+    close(fd);return NULL;
 }
 
 static void *
@@ -441,10 +561,13 @@ pong_touch_start(void)
     IOHIDEventCreateKeyboardEvent=(__typeof__(IOHIDEventCreateKeyboardEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateKeyboardEvent");
     IOHIDUserDeviceCreate=(__typeof__(IOHIDUserDeviceCreate))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceCreate");
     IOHIDUserDeviceHandleReportWithTimeStamp=(__typeof__(IOHIDUserDeviceHandleReportWithTimeStamp))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceHandleReportWithTimeStamp");
+    IOHIDEventCreateDigitizerStylusEventWithPolarOrientation=(__typeof__(IOHIDEventCreateDigitizerStylusEventWithPolarOrientation))
+        dlsym(RTLD_DEFAULT,"IOHIDEventCreateDigitizerStylusEventWithPolarOrientation");
     RESOLVE(IOHIDEventAppendEvent);
     RESOLVE(IOHIDEventSetIntegerValue);
 #undef RESOLVE
     pthread_t thread;
     if (!pthread_create(&thread,NULL,input_thread,NULL)) pthread_detach(thread);
+    if(!pthread_create(&thread,NULL,pen_thread,NULL))pthread_detach(thread);
     if (IOHIDEventCreateKeyboardEvent && !pthread_create(&thread,NULL,buttons_thread,NULL)) pthread_detach(thread);
 }

@@ -12,22 +12,38 @@ static const struct {uint8_t opcode, property, slow;} kFields[BmFields] = {
     [BmCapacity] = {SHENG_BATTMGR_OP_BATTERY_GET, 4, 0},
     [BmVoltage] = {SHENG_BATTMGR_OP_BATTERY_GET, 7, 0},
     [BmCurrent] = {SHENG_BATTMGR_OP_BATTERY_GET, 9, 0},
+#if PONG_BATTERY_LIUQIN
+    [BmTemperature] = {SHENG_BATTMGR_OP_BATTERY_GET, 13, 0},
+    [BmCharge] = {SHENG_BATTMGR_OP_BATTERY_GET, 15, 0},
+#else
     [BmTemperature] = {SHENG_BATTMGR_OP_BATTERY_GET, 12, 0},
     [BmCharge] = {SHENG_BATTMGR_OP_BATTERY_GET, 14, 0},
+#endif
     [BmUsbOnline] = {SHENG_BATTMGR_OP_USB_GET, 0, 0},
     [BmUsbType] = {SHENG_BATTMGR_OP_USB_GET, 6, 0},
     [BmUsbVoltage] = {SHENG_BATTMGR_OP_USB_GET, 1, 0},
     [BmUsbCurrent] = {SHENG_BATTMGR_OP_USB_GET, 3, 0},
+#if PONG_BATTERY_LIUQIN
+    [BmTimeToEmpty] = {SHENG_BATTMGR_OP_BATTERY_GET, 21, 0},
+    [BmTimeToFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 20, 0},
+#else
     [BmTimeToEmpty] = {SHENG_BATTMGR_OP_BATTERY_GET, 20, 0},
     [BmTimeToFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 19, 0},
+#endif
     /* the fuel gauges: remaining and full charge of each (mAh) */
     [BmGauge1Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8a, 0},
     [BmGauge1Full] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8b, 0},
     [BmGauge2Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0xa6, 0},
     [BmGauge2Full] = {SHENG_BATTMGR_OP_BOARD_GET, 0xa7, 0},
+#if PONG_BATTERY_LIUQIN
+    [BmFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 18, 1},
+    [BmDesign] = {SHENG_BATTMGR_OP_BATTERY_GET, 17, 1},
+    [BmCycles] = {SHENG_BATTMGR_OP_BATTERY_GET, 16, 1},
+#else
     [BmFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 17, 1},
     [BmDesign] = {SHENG_BATTMGR_OP_BATTERY_GET, 16, 1},
     [BmCycles] = {SHENG_BATTMGR_OP_BATTERY_GET, 15, 1},
+#endif
     [BmUsbAdapter] = {SHENG_BATTMGR_OP_USB_GET, 7, 0},
     [BmUsbLimit] = {SHENG_BATTMGR_OP_USB_GET, 5, 0},
     [BmUsbMax] = {SHENG_BATTMGR_OP_USB_GET, 4, 0},
@@ -80,7 +96,13 @@ static void skip_to_wanted(ShengBattmgr *b)
     while(b->cursor<BmFields &&
        (kFields[b->cursor].opcode==SHENG_BATTMGR_OP_BOARD_GET ||
         b->cursor==BmChargeCurrent ||
-        (kFields[b->cursor].slow&&!b->slow_due)))b->cursor++;
+         (kFields[b->cursor].slow&&!b->slow_due)
+#if PONG_BATTERY_LIUQIN
+         // First bring-up publishes percent only. Android's charge counter
+         // units differ from the older source; time sentinels are ambiguous.
+         || b->cursor==BmCharge || b->cursor==BmTimeToEmpty || b->cursor==BmTimeToFull
+#endif
+         ))b->cursor++;
 }
 
 static void advance(ShengBattmgr *b)
@@ -103,6 +125,9 @@ void sheng_battmgr_refresh(ShengBattmgr *b, int slow)
 uint32_t sheng_battmgr_next(ShengBattmgr *b, uint8_t out[SHENG_BATTMGR_REQUEST_BYTES])
 {
     if (b->in_flight || b->limit_in_flight) return 0;
+#if PONG_POWER_BATTERY_ONLY
+    b->limit_due = 0; // compile-time read-only: never emit USB_SET
+#endif
     if (b->limit_due) {
         header(out, SHENG_BATTMGR_OP_USB_SET);
         put32(out + 12, 0);
@@ -199,10 +224,19 @@ int sheng_battmgr_receive(ShengBattmgr *b, const uint8_t *data, uint32_t length)
         b->valid &= ~(1u << b->cursor);
     } else {
         const int32_t signed_value=(int32_t)value;
-        if(b->cursor==BmTemperature && (signed_value < -400 || signed_value > 900)) {
+#if PONG_BATTERY_LIUQIN
+        const int minimum_temperature = -4000, maximum_temperature = 9000;
+#else
+        const int minimum_temperature = -400, maximum_temperature = 900;
+#endif
+        if(b->cursor==BmTemperature && (signed_value < minimum_temperature || signed_value > maximum_temperature)) {
             b->errors++;b->valid &= ~(1u << b->cursor);
         } else {
+#if PONG_BATTERY_LIUQIN
+            b->value[b->cursor]=signed_value; // PMIC temperature is hundredths C; Linux divides by 10
+#else
             b->value[b->cursor]=b->cursor==BmTemperature?signed_value*10:signed_value;
+#endif
             b->valid |= 1u << b->cursor;
             b->fresh |= 1u << b->cursor;
         }
@@ -255,7 +289,11 @@ void sheng_battmgr_snapshot(const ShengBattmgr *b, ShengBatterySnapshot *s)
     s->fully_charged = s->external && status == 4;
     s->critical = s->present && !s->external && s->percent <= 2;
     s->voltage_mv = HAS(BmVoltage) ? V(BmVoltage) / 1000 : 0;
+#if PONG_BATTERY_LIUQIN
+    s->current_ma = HAS(BmCurrent) ? V(BmCurrent) / 1000 : 0;
+#else
     s->current_ma = HAS(BmCurrent) ? -V(BmCurrent) / 1000 : 0;
+#endif
     /* -40 to 90 C; the firmware answers a fixed out-of-range value when it has no reading */
     s->temperature_valid = HAS(BmTemperature) && V(BmTemperature) >= -4000 && V(BmTemperature) <= 9000;
     s->temperature = s->temperature_valid ? V(BmTemperature) : 0;

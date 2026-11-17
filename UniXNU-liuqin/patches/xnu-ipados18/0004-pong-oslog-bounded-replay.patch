@@ -1,0 +1,15 @@
+--- a/libkern/os/log.c
++++ b/libkern/os/log.c
+@@ -663,7 +663,11 @@
+ 			 * make one loop up to write pointer - 1.
+ 			 */
+ 			p = msgbufp->msg_bufc + position;
+-			for (i = newl = 0; p != msgbufp->msg_bufc + msgbufp->msg_bufx - 1; ++p) {
++			/* Bound zero-byte traversal and keep the end pointer inside the ring. */
++			char *replay_end = msgbufp->msg_bufc +
++			    (msgbufp->msg_bufx ? msgbufp->msg_bufx : msgbufp->msg_size) - 1;
++			uint32_t walked = 0;
++			for (i = newl = 0; walked < msgbufp->msg_size && p != replay_end; ++p, ++walked) {
+ 				if (p >= msgbufp->msg_bufc + msgbufp->msg_size) {
+ 					p = msgbufp->msg_bufc;
+ 				}

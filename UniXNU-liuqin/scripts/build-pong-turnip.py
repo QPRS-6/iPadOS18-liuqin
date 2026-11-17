@@ -28,23 +28,41 @@ def main():
     p.add_argument('--developer-dir', type=Path, default=pong_paths.developer_dir())
     a = p.parse_args()
     backend = a.mesa / 'src/freedreno/vulkan/tu_knl_darwin.cc'
-    if 'MIN2(tu_get_system_heap_size(device), info->va_size)' not in backend.read_text():
+    legacy='PONG_TURNIP_BACKEND_V2' not in backend.read_text()
+    if legacy and 'MIN2(tu_get_system_heap_size(device), info->va_size)' not in backend.read_text():
         subprocess.run(['git', 'apply', str(ROOT / 'patches/mesa/0001-pong-scoped-gpu-heap.patch')],
                        cwd=a.mesa, check=True)
-    if 'NativeAdrenoMethodSubmitBatch' not in backend.read_text():
+    if legacy and 'NativeAdrenoMethodSubmitBatch' not in backend.read_text():
         subprocess.run(['git','apply',str(ROOT/'patches/mesa/0003-pong-atomic-batches-and-fence-wait.patch')],cwd=a.mesa,check=True)
     copies = a.mesa / 'src/freedreno/vulkan/tu_clear_blit.cc'
     if 'reserve_buffer_copy_step' not in copies.read_text():
         subprocess.run(['git', 'apply', str(ROOT / 'patches/mesa/0004-pong-buffer-copy-allocation-errors.patch')],
                        cwd=a.mesa, check=True)
+    if a.guest_build=='22H374' and legacy:
+        for marker,patch in (('darwin_bind_current_window','0062-pong-active-device-lease.patch'),
+                             ('Pong Turnip device-lost:','0063-pong-allocation-failure-evidence.patch')):
+            if marker not in backend.read_text():
+                subprocess.run(['git','apply',str(ROOT/'patches/mesa'/patch)],cwd=a.mesa,check=True)
+    if a.guest_build=='22H374':
+        subprocess.run([sys.executable,str(ROOT/'scripts/stage-pong-turnip-backend.py'),
+                        '--mesa',str(a.mesa)],check=True)
+        if 'tu_attachment_unpadded' not in copies.read_text():
+            subprocess.run(['git','apply',str(ROOT/'patches/mesa/0066-pong-imported-gmem-edges.patch')],
+                           cwd=a.mesa,check=True)
     abi=a.abi_directory/'NativeAdrenoABI.h'
     if 'NativeAdrenoMethodSubmitBatch' not in abi.read_text():
         raise SystemExit('Use the Pong ABI header with negotiated 128-IB submissions: '+str(abi))
     out = a.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     minimum='18.0' if a.guest_build=='22H374' else '16.6.1'
-    env = dict(os.environ, DEVELOPER_DIR=str(a.developer_dir),
-               IPHONEOS_DEPLOYMENT_TARGET=minimum)
+    env = dict(os.environ, DEVELOPER_DIR=str(a.developer_dir))
+    # The cross file carries the target and SDK. Native tools/sanity checks
+    # must remain macOS executables: global iOS environment variables also
+    # affect Meson's build-machine compiler and can make its test executable
+    # an iOS binary which macOS kills instead of running.
+    for key in ('IPHONEOS_DEPLOYMENT_TARGET', 'TVOS_DEPLOYMENT_TARGET',
+                'WATCHOS_DEPLOYMENT_TARGET', 'SDKROOT'):
+        env.pop(key, None)
     env['PATH'] = pong_paths.path_with(a.tools_directory, a.venv / 'bin', pong_paths.extra_path(),
         *(['/opt/local/bin'] if pong_paths.macports() else []))
     # Do not inherit another Vulkan/IR3 build's diagnostic or compiler knobs.

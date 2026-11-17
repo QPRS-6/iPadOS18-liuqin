@@ -62,7 +62,7 @@ bool PongAdrenoUserClient::mount(task_t task)
     if(!core || !views || !operations)return false;
     IOLockLock(client_gate);
     for(unsigned i=0;i<ClientSlots;i++)if(!slots[i]){slot=i;break;}
-    IOReturn result=slot<ClientSlots?core->open(NativeAdrenoAbiVersion,backend->vm,backend->submit,backend->ring,32,backend->output_bits):kIOReturnNoResources;
+    IOReturn result=slot<ClientSlots?core->open(NativeAdrenoAbiVersion,backend->vm,backend->submit,backend->ring,backend->input_bits,backend->output_bits):kIOReturnNoResources;
     if(!result)result=core->setScope(slot*NativeAdrenoAbiMaxQueues,windows[slot].start,windows[slot].bytes);
     if(!result)result=core->attachTimer(backend->timer);
     if(!result)result=core->attachStatus(backend->status);

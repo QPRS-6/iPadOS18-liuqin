@@ -119,6 +119,7 @@ static void hostWrite(unsigned offset, uint32_t value) { write32(gHost.hc, offse
 #include "RootLayout.h"
 
 // ---- Persistent console log in the last 4 MiB of the flashed image ----
+#include "PongLogPolicy.h"
 // The log area lies after every SHNGROOT window. The console putc path feeds
 // a DRAM ring; a 5 s worker snapshots it to UFS so a hung display still leaves
 // a readable boot log on the partition.
@@ -127,6 +128,7 @@ static uint8_t gPongLogRing[kPongLogBytes];
 static volatile uint32_t gPongLogHead;
 static uint64_t gPongLogLba;
 static uint32_t gPongLogEnabled, gPongLogWritten, gPongLogFlushes;
+static uint32_t gPongLogFlushBudget=PongLogDefaultFlushes;
 
 extern "C" void pong_log_putc(char c)
 {
@@ -169,7 +171,7 @@ static bool pongLogWrite(uint64_t lba, const uint8_t *data, uint32_t bytes)
 static void pongLogFlush(void)
 {
     if (!gPongLogEnabled || !gHost.ready || !gHost.writable || gHost.poisoned) return;
-    if (gPongLogFlushes >= 240) return; // ~20 min at 5 s
+    if (gPongLogFlushes >= gPongLogFlushBudget) return;
     uint32_t head = __atomic_load_n(&gPongLogHead, __ATOMIC_ACQUIRE);
     if (head == gPongLogWritten && gPongLogFlushes) return;
     uint32_t length;
@@ -249,6 +251,10 @@ static void pongLogStart(const RootLayout &layout)
         verified ? "verified" : marked ? "readback-mismatch" : "write-failed",
         gPongLogLba, layout.userdataFirst, layout.userdataLast, layout.imageBytes);
     if (!marked) return;
+    uint32_t requested=PongLogDefaultFlushes;
+    PE_parse_boot_argn("pong_log_flushes",&requested,sizeof(requested));
+    gPongLogFlushBudget=pongLogFlushBudget(requested);
+    IOLog("PONG_LOG: finite flush budget=%u interval_ms=5000 max_body_bytes=%u\n",gPongLogFlushBudget,kPongLogBytes);
     gPongLogEnabled = 1;
     pongLogFlush();
     thread_t thread = THREAD_NULL;

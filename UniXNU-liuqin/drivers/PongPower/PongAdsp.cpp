@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 extern "C" {
 kern_return_t clear_wait(thread_t, wait_result_t);
+kern_return_t thread_terminate(thread_t);
 #include "QcomGlink.h"
 #include "QcomMdt.h"
 #include "QcomQmp.h"
@@ -43,7 +44,13 @@ enum Stage {
 };
 constexpr uint64_t kSmem = 0x80900000, kSmemSize = 0x200000, kMutex = 0x1f40000 + 3 * 0x1000, kIpcc = 0x0ed18000, kAoss = 0xc300000;
 constexpr uint64_t kRscDrv = 0x17a20000, kRscTcs = 0xd00, kCmdDb = 0x80860000, kCmdDbSize = 0x20000;
+#if PONG_BATTERY_LIUQIN
+// liuqin mainline reserved-memory/adsp_mem; matches the OS3 PAS1 image's
+// 0x3100000 relocation span. Never expand Nothing's 0x85700000 allocation.
+constexpr uint64_t kAdspBase = 0x9fd00000, kAdspSize = 0x3100000, kDtbBase = 0, kDtbSize = 0;
+#else
 constexpr uint64_t kAdspBase = 0x85700000, kAdspSize = 0x2800000, kDtbBase = 0x9e980000, kDtbSize = 0x80000;
+#endif
 constexpr uint32_t kPasAdsp = 1, kPasDtb = 36, kRemotePid = 2, kItemIn = 443, kItemOut = 429, kItemCrash = 423;
 constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480, kGlinkFifo = 0x4000;
 constexpr uint32_t kSpiIpcc = 229, kSpiRsc = 5;
@@ -603,6 +610,14 @@ bool startGlink() {
     return true;
 }
 
+static void finishAdspThread() {
+    // A kernel-thread entry must not return through a C call frame. Stop only
+    // this optional worker, leaving the normal UI boot and panic path intact.
+    thread_terminate(current_thread());
+    thread_block(THREAD_CONTINUE_NULL);
+    __builtin_unreachable();
+}
+
 void adspThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pong_adsp");
     unsigned mode = 0;
@@ -610,7 +625,7 @@ void adspThread(void *, wait_result_t) {
     if (!mapWindow(gSmemW, kSmem, kSmemSize) || !mapWindow(gMutex, kMutex, 0x1000) || !mapWindow(gIpcc, kIpcc, 0x1000) ||
         !mapWindow(gAoss, kAoss, 0x1000) || !mapWindow(gRsc, kRscDrv, 0x10000)) {
         fail(StMapped, -12);releaseFirmwareScratch();
-        return;
+        finishAdspThread();
     }
     gSmem = {gSmemW.va, (uint32_t)kSmemSize};
     gLayout = qcom_rsc_layout(rd(gRsc, 0));
@@ -619,14 +634,14 @@ void adspThread(void *, wait_result_t) {
     stage(StSurveyed);
     const bool loaded=mode>=2 && start();
     releaseFirmwareScratch();
-    if (!loaded || !startGlink()) return;
+    if (!loaded || !startGlink()) {finishAdspThread();return;}
     // From here on the thread only answers doorbells and client sends; with nothing pending it sleeps without a deadline, except while
     // a send waits for an intent or FIFO room (then it looks again every second).
     for (;;) {
         bool pending = false;
         for (unsigned i = 0; i < gClientCount; ++i) pending |= gClients[i].count != 0;
         service(waitEvents(100) | kEvSmp2p | kEvGlink | (pending ? kEvSend : 0));
-        if(gSlave & kFatal){IOLog("PongAdsp: fatal %s\n",native_adsp_text);for(unsigned i=0;i<gClientCount;i++)if(gClients[i].client.state)gClients[i].client.state(gClients[i].context,0);return;}
+        if(gSlave & kFatal){IOLog("PongAdsp: fatal %s\n",native_adsp_text);for(unsigned i=0;i<gClientCount;i++)if(gClients[i].client.state)gClients[i].client.state(gClients[i].context,0);finishAdspThread();return;}
     }
 }
 }  // namespace

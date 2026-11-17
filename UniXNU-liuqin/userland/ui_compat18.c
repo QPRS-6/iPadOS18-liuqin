@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1433,6 +1434,694 @@ static id singleton(const char *name)
         ((id(*)(id,SEL))objc_msgSend)((id)cls,selector):nil;
 }
 
+/* Pong 22H374: the KTZ8866 deliberately publishes no AppleARMBacklight
+ * service. Publishing one makes CoreBrightness adopt it, and this port's
+ * display then collapses to a fraction of a frame per second (docs/BUILD.zh.md).
+ * Instead the native display-brightness setters in SpringBoard are forwarded to
+ * kern.pong_backlight; the original implementation still runs, so screen state,
+ * HUDs and lock-screen behaviour stay native. */
+struct pong_backlight_hook {
+    SEL  selector;
+    IMP  original;
+    char kind;          /* 'f' float first argument, 'd' double */
+    char extra;         /* 'l' when a second scalar argument follows */
+};
+static struct pong_backlight_hook pong_backlight_hooks[32];
+static unsigned pong_backlight_hook_count;
+
+static uint32_t pong_backlight_connection;
+static uint64_t pong_backlight_open_attempt;
+static pthread_mutex_t pong_backlight_connection_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Second channel: the kernel publishes a bare PongBacklight service with a
+ * generic user client, so IOConnectSetCFProperties lands in setProperties()
+ * without CoreBrightness ever seeing an AppleARMBacklight. */
+static bool
+pong_backlight_iokit_open(void)
+{
+    if (pong_backlight_connection) {
+        return true;
+    }
+    /* Retry at most once a second: the service is published by the kernel at
+     * framebuffer start, which can be later than the first slider callback. */
+    struct timespec now = {0, 0};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t stamp = (uint64_t)now.tv_sec;
+    if (stamp == pong_backlight_open_attempt) {
+        return false;
+    }
+    pong_backlight_open_attempt = stamp;
+    CFMutableDictionaryRef (*matching)(const char *) =
+        dlsym(RTLD_DEFAULT, "IOServiceMatching");
+    uint32_t (*get)(uint32_t, CFDictionaryRef) =
+        dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+    int (*release)(uint32_t) = dlsym(RTLD_DEFAULT, "IOObjectRelease");
+    int (*open)(uint32_t, uint32_t, uint32_t, uint32_t *) =
+        dlsym(RTLD_DEFAULT, "IOServiceOpen");
+    if (!matching || !get || !release || !open) {
+        return false;
+    }
+    CFMutableDictionaryRef dict = matching("PongBacklight");
+    if (!dict) {
+        return false;
+    }
+    uint32_t service = get(0, dict);
+    /* IOServiceGetMatchingService consumes the matching dictionary. */
+    if (!service) {
+        static unsigned reported;
+        if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 3) {
+            fprintf(stderr, "Pong backlight18: PongBacklight service absent\n");
+        }
+        return false;
+    }
+    int kr = open(service, mach_task_self(), 0, &pong_backlight_connection);
+    release(service);
+    if (kr != 0) {
+        pong_backlight_connection = 0;
+        static unsigned reported;
+        if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 3) {
+            fprintf(stderr, "Pong backlight18: IOServiceOpen failed kr=%#x\n", kr);
+        }
+    }
+    return pong_backlight_connection != 0;
+}
+
+static bool
+pong_backlight_iokit_set_locked(int level)
+{
+    if (!pong_backlight_iokit_open()) {
+        return false;
+    }
+    int (*set_properties)(uint32_t, CFDictionaryRef) =
+        dlsym(RTLD_DEFAULT, "IOConnectSetCFProperties");
+    if (!set_properties) {
+        return false;
+    }
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(NULL, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &level);
+    if (!props || !number) {
+        if (props) CFRelease(props);
+        if (number) CFRelease(number);
+        return false;
+    }
+    CFDictionarySetValue(props, CFSTR("brightness"), number);
+    int kr = set_properties(pong_backlight_connection, props);
+    CFRelease(props);
+    CFRelease(number);
+    return kr == 0;
+}
+
+static bool pong_backlight_iokit_set(int level)
+{
+    pthread_mutex_lock(&pong_backlight_connection_lock);
+    bool result = pong_backlight_iokit_set_locked(level);
+    pthread_mutex_unlock(&pong_backlight_connection_lock);
+    return result;
+}
+
+static bool pong_backlight_iokit_get(int *level)
+{
+    pthread_mutex_lock(&pong_backlight_connection_lock);
+    int (*call)(uint32_t,uint32_t,const uint64_t *,uint32_t,uint64_t *,uint32_t *) =
+        dlsym(RTLD_DEFAULT,"IOConnectCallScalarMethod");
+    uint64_t output[2] = {0,0}; uint32_t count = 2;
+    bool ok = call && pong_backlight_iokit_open() &&
+        !call(pong_backlight_connection,0,NULL,0,output,&count) &&
+        count == 2 && output[1] == 2047 && output[0] <= output[1];
+    if (ok) *level = (int)output[0];
+    pthread_mutex_unlock(&pong_backlight_connection_lock);
+    return ok;
+}
+
+static void
+pong_backlight_apply(float value)
+{
+    int level;
+    /* BKS and DisplayBrightness use a normalized float, never nits or percent. */
+    if (!(value >= 0.0f && value <= 1.5f)) return;
+    if (value > 1.0f) value = 1.0f;
+    level = (int)(value * 2047.0f + 0.5f);
+    if (level < 0) {
+        level = 0;
+    }
+    if (level > 2047) {
+        level = 2047;
+    }
+    int request = level;
+    int sysctl_error = 0;
+    bool applied = false;
+    const char *channel = "none";
+    if (sysctlbyname("kern.pong_backlight", NULL, NULL, &request,
+            sizeof(request)) == 0) {
+        applied = true;
+        channel = "sysctl";
+    } else {
+        sysctl_error = errno;
+        if (pong_backlight_iokit_set(level)) {
+            applied = true;
+            channel = "iokit";
+        }
+    }
+    static int reported = -1;
+    if (level != reported) {
+        reported = level;
+        fprintf(stderr, "Pong backlight18: level %d (request %g) via %s%s\n",
+            level, (double)value, channel, applied ? "" : " FAILED");
+        if (!applied && sysctl_error) {
+            fprintf(stderr, "Pong backlight18: sysctl errno=%d\n", sysctl_error);
+        }
+    }
+}
+
+static struct pong_backlight_hook *
+pong_backlight_hook_for(SEL selector, char kind, char extra)
+{
+    for (unsigned i = 0; i < pong_backlight_hook_count; i++) {
+        struct pong_backlight_hook *hook = &pong_backlight_hooks[i];
+        if (hook->selector == selector && hook->kind == kind &&
+            hook->extra == extra) {
+            return hook;
+        }
+    }
+    return NULL;
+}
+
+static void
+pong_backlight_f(id self, SEL selector, float value)
+{
+    struct pong_backlight_hook *hook =
+        pong_backlight_hook_for(selector, 'f', 0);
+    pong_backlight_apply(value);
+    if (hook) {
+        ((void (*)(id, SEL, float))hook->original)(self, selector, value);
+    }
+}
+
+static void
+pong_backlight_fl(id self, SEL selector, float value, long extra)
+{
+    struct pong_backlight_hook *hook =
+        pong_backlight_hook_for(selector, 'f', 'l');
+    pong_backlight_apply(value);
+    if (hook) {
+        ((void (*)(id, SEL, float, long))hook->original)(self, selector, value,
+            extra);
+    }
+}
+
+static void
+pong_backlight_d(id self, SEL selector, double value)
+{
+    struct pong_backlight_hook *hook =
+        pong_backlight_hook_for(selector, 'd', 0);
+    pong_backlight_apply((float)value);
+    if (hook) {
+        ((void (*)(id, SEL, double))hook->original)(self, selector, value);
+    }
+}
+
+static void
+pong_backlight_dl(id self, SEL selector, double value, long extra)
+{
+    struct pong_backlight_hook *hook =
+        pong_backlight_hook_for(selector, 'd', 'l');
+    pong_backlight_apply((float)value);
+    if (hook) {
+        ((void (*)(id, SEL, double, long))hook->original)(self, selector, value,
+            extra);
+    }
+}
+
+static bool
+pong_backlight_scalar(char kind)
+{
+    return kind == 'i' || kind == 'I' || kind == 'B' || kind == 'c' ||
+        kind == 'C' || kind == 's' || kind == 'S' || kind == 'l' ||
+        kind == 'L' || kind == 'q' || kind == 'Q';
+}
+
+static void
+pong_backlight_hook_class(const char *name)
+{
+    Class cls = objc_lookUpClass(name);
+    if (!cls) {
+        return;
+    }
+    unsigned count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    for (unsigned i = 0; methods && i < count; i++) {
+        Method method = methods[i];
+        const char *selector = sel_getName(method_getName(method));
+        if (!selector || !strcasestr(selector, "set") ||
+            strcasestr(selector, "minimum") ||
+            (!strcasestr(selector, "bright") && !strcasestr(selector, "level"))) {
+            continue;
+        }
+        char *result = method_copyReturnType(method);
+        bool returns_void = result && result[0] == 'v';
+        free(result);
+        if (!returns_void) {
+            continue;
+        }
+        unsigned argc = method_getNumberOfArguments(method);
+        if (argc != 3 && argc != 4) {
+            continue;
+        }
+        char *first = method_copyArgumentType(method, 2);
+        char kind = (first && first[0] == 'f') ? 'f' :
+                    (first && first[0] == 'd') ? 'd' : 0;
+        free(first);
+        char extra = 0;
+        if (kind && argc == 4) {
+            char *second = method_copyArgumentType(method, 3);
+            extra = (second && pong_backlight_scalar(second[0])) ? 'l' : 0;
+            free(second);
+            if (!extra) {
+                continue;
+            }
+        }
+        if (!kind || pong_backlight_hook_count >= 32) {
+            continue;
+        }
+        IMP current = method_getImplementation(method);
+        if (current == (IMP)pong_backlight_f || current == (IMP)pong_backlight_fl ||
+            current == (IMP)pong_backlight_d || current == (IMP)pong_backlight_dl) {
+            continue;
+        }
+        IMP replacement = 0;
+        if (kind == 'f') {
+            replacement = extra ? (IMP)pong_backlight_fl : (IMP)pong_backlight_f;
+        } else {
+            replacement = extra ? (IMP)pong_backlight_dl : (IMP)pong_backlight_d;
+        }
+        struct pong_backlight_hook *hook =
+            &pong_backlight_hooks[pong_backlight_hook_count++];
+        hook->selector = method_getName(method);
+        hook->original = method_getImplementation(method);
+        hook->kind = kind;
+        hook->extra = extra;
+        method_setImplementation(method, replacement);
+        fprintf(stderr, "Pong backlight18: hooked %s %s%s\n", name, selector,
+            extra ? " (two arguments)" : "");
+    }
+    free(methods);
+}
+
+/* SpringBoard's Control Center brightness slider talks to CoreBrightness
+ * through BrightnessSystemClient, not through the SB setter shims above, so
+ * the property entry point is hooked as well. Only recognised keys are acted
+ * on; everything else is forwarded untouched. */
+struct pong_object_hook {
+    SEL selector;
+    IMP original;
+    char extra;
+};
+static struct pong_object_hook pong_object_hooks[8];
+static unsigned pong_object_hook_count;
+
+static bool
+pong_backlight_key(const char *key)
+{
+    /* Exact names only: DisplayBrightnessFadePeriod, ...Max, ...Min and the
+     * other CoreBrightness siblings carry numbers that are not a level. */
+    static const char *const names[] = {
+        "DisplayBrightness",
+        "DisplayBrightness2",
+        "DisplayBrightnessFactor",
+        "DisplayBrightnessSliderPosition",
+        "Brightness",
+    };
+    if (!key) {
+        return false;
+    }
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(key, names[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+pong_backlight_forward_warning(const char *selector)
+{
+    static unsigned warned;
+    if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 8) {
+        fprintf(stderr, "Pong backlight18: client selector not hooked: %s\n",
+            selector);
+    }
+}
+
+/* backboardd logs "Set BrightnessSystem property:DisplayBrightness to:{ Brightness: 0.5 ... }":
+ * the value of the key is a dictionary, not a number. */
+static id
+pong_backlight_number_from(id value)
+{
+    if (!value) {
+        return nil;
+    }
+    if (CFGetTypeID((CFTypeRef)value) == CFDictionaryGetTypeID()) {
+        static const char *const inner[] = { "Brightness", "BrightnessFactor" };
+        for (unsigned i = 0; i < sizeof(inner) / sizeof(inner[0]); i++) {
+            CFStringRef key = CFStringCreateWithCString(NULL, inner[i],
+                kCFStringEncodingUTF8);
+            if (!key) {
+                continue;
+            }
+            id found = (id)CFDictionaryGetValue((CFDictionaryRef)value, key);
+            CFRelease((CFTypeRef)key);
+            if (found && CFGetTypeID((CFTypeRef)found) == CFNumberGetTypeID()) {
+                return found;
+            }
+        }
+        return nil;
+    }
+    return value;
+}
+
+static void
+pong_backlight_apply_value(id first, id second)
+{
+    id key = nil;
+    id value = nil;
+    if (first && CFGetTypeID((CFTypeRef)first) == CFStringGetTypeID()) {
+        key = first;
+        value = second;
+    } else {
+        value = first;
+        key = second;
+    }
+    if (!key || CFGetTypeID((CFTypeRef)key) != CFStringGetTypeID()) {
+        return;
+    }
+    char buffer[128];
+    if (!CFStringGetCString((CFStringRef)key, buffer, sizeof(buffer),
+            kCFStringEncodingUTF8)) {
+        return;
+    }
+    if (!pong_backlight_key(buffer)) {
+        return;
+    }
+    double number = 0;
+    value = pong_backlight_number_from(value);
+    if (!value || CFGetTypeID((CFTypeRef)value) != CFNumberGetTypeID() ||
+        !CFNumberGetValue((CFNumberRef)value, kCFNumberDoubleType, &number)) {
+        fprintf(stderr, "Pong backlight18: client %s (no number inside)\n", buffer);
+        return;
+    }
+    if (number < 0.0) {
+        number = 0.0;
+    }
+    fprintf(stderr, "Pong backlight18: client %s = %g\n", buffer, number);
+    pong_backlight_apply((float)number);
+}
+
+static BOOL
+pong_backlight_client_property(id self, SEL selector, id first, id second)
+{
+    pong_backlight_apply_value(first, second);
+    for (unsigned i = 0; i < pong_object_hook_count; i++) {
+        struct pong_object_hook *hook = &pong_object_hooks[i];
+        if (hook->selector == selector && hook->extra == 0) {
+            return ((BOOL (*)(id, SEL, id, id))hook->original)(self, selector,
+                first, second);
+        }
+    }
+    pong_backlight_forward_warning(sel_getName(selector));
+    return NO;
+}
+
+static BOOL
+pong_backlight_client_property_display(id self, SEL selector, id first,
+    id second, unsigned long long display)
+{
+    pong_backlight_apply_value(first, second);
+    for (unsigned i = 0; i < pong_object_hook_count; i++) {
+        struct pong_object_hook *hook = &pong_object_hooks[i];
+        if (hook->selector == selector && hook->extra == 'l') {
+            return ((BOOL (*)(id, SEL, id, id, unsigned long long))
+                hook->original)(self, selector, first, second, display);
+        }
+    }
+    pong_backlight_forward_warning(sel_getName(selector));
+    return NO;
+}
+
+static void
+pong_backlight_hook_client_class(const char *class_name)
+{
+    Class cls = objc_lookUpClass(class_name);
+    if (!cls) {
+        return;
+    }
+    unsigned count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    static bool dumped;
+    if (!dumped) {
+        dumped = true;
+        unsigned shown = 0;
+        for (unsigned i = 0; methods && i < count && shown < 24; i++) {
+            const char *name = sel_getName(method_getName(methods[i]));
+            if (!name || !strstr(name, "roperty")) {
+                continue;
+            }
+            fprintf(stderr, "Pong backlight18: %s method %s %s\n", class_name,
+                name, method_getTypeEncoding(methods[i]));
+            shown++;
+        }
+    }
+    for (unsigned i = 0; methods && i < count; i++) {
+        Method method = methods[i];
+        const char *name = sel_getName(method_getName(method));
+        if (!name || pong_object_hook_count >= 8 ||
+            (strncmp(name, "setProperty", 11) != 0 &&
+             strncmp(name, "handleBrightnessSystemNotification", 34) != 0)) {
+            continue;
+        }
+        char *result = method_copyReturnType(method);
+        bool returns_bool = result && (result[0] == 'B' || result[0] == 'c' ||
+            false);
+        free(result);
+        char *first = method_copyArgumentType(method, 2);
+        char *second = method_copyArgumentType(method, 3);
+        bool object_args = first && first[0] == '@' && second && second[0] == '@';
+        free(first);
+        free(second);
+        if (!returns_bool || !object_args) {
+            continue;
+        }
+        unsigned argc = method_getNumberOfArguments(method);
+        IMP replacement = 0;
+        char extra = 0;
+        if (argc == 4) {
+            replacement = (IMP)pong_backlight_client_property;
+        } else if (argc == 5) {
+            char *third = method_copyArgumentType(method, 4);
+            bool display_id = third && third[0] == 'Q' && strstr(name, "andDisplay:");
+            free(third);
+            if (!display_id) continue;
+            extra = 'l';
+            replacement = (IMP)pong_backlight_client_property_display;
+        } else {
+            continue;
+        }
+        IMP current = method_getImplementation(method);
+        if (current == (IMP)pong_backlight_client_property ||
+            current == (IMP)pong_backlight_client_property_display) {
+            continue;
+        }
+        struct pong_object_hook *hook =
+            &pong_object_hooks[pong_object_hook_count++];
+        hook->selector = method_getName(method);
+        hook->original = method_getImplementation(method);
+        hook->extra = extra;
+        method_setImplementation(method, replacement);
+        fprintf(stderr, "Pong backlight18: hooked %s %s\n", class_name, name);
+    }
+    free(methods);
+}
+
+static void
+pong_backlight_hook_client(void)
+{
+    /* The client classes exist in every process that asks for brightness; the
+     * internal ones are the server side inside backboardd.  Hooking both means
+     * the Settings slider, Control Center and anything else are all seen. */
+    static const char *const classes[] = {
+        "BrightnessSystemClient",
+        "BrightnessSystemClientInternal",
+        "BrightnessSystem",
+        "CBClient",
+    };
+    for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+        pong_backlight_hook_client_class(classes[i]);
+    }
+}
+
+/* One-time census of the brightness methods of the loaded classes. The slider
+ * in iOS 18 does not reach BrightnessSystemClient, so this says which class
+ * does carry it (CBDisplayModule, CBBrightnessProxy, ...). */
+static void
+pong_backlight_dump_classes(void)
+{
+    static bool dumped;
+    if (dumped) {
+        return;
+    }
+    dumped = true;
+    unsigned total = objc_getClassList(NULL, 0);
+    if (!total) {
+        return;
+    }
+    Class *classes = malloc(total * sizeof(Class));
+    if (!classes) {
+        return;
+    }
+    total = objc_getClassList(classes, total);
+    unsigned shown = 0;
+    for (unsigned i = 0; i < total && shown < 120; i++) {
+        const char *name = class_getName(classes[i]);
+        if (!name || (!strstr(name, "Brightness") && !strstr(name, "CBDisplay") &&
+            !strstr(name, "CBClient"))) {
+            continue;
+        }
+        unsigned count = 0;
+        Method *methods = class_copyMethodList(classes[i], &count);
+        for (unsigned m = 0; m < count && shown < 120; m++) {
+            const char *selector = sel_getName(method_getName(methods[m]));
+            if (!selector || !strcasestr(selector, "bright")) {
+                continue;
+            }
+            fprintf(stderr, "Pong backlight18: dump %s %s %s\n", name, selector,
+                method_getTypeEncoding(methods[m]));
+            shown++;
+        }
+        free(methods);
+    }
+    free(classes);
+    fprintf(stderr, "Pong backlight18: dump done (%u)\n", shown);
+}
+
+static void pong_backlight18_start(void);
+
+static bool pong_backlight18_retry_scheduled;
+
+static void
+pong_backlight18_retry(void *unused)
+{
+    (void)unused;
+    pong_backlight18_retry_scheduled = false;
+    pong_backlight18_start();
+}
+
+static void
+pong_backlight18_start(void)
+{
+    /* Broad ObjC hooks shared originals by SEL across different classes. Keep
+     * them out of the runtime; the checked BKS entry points below own this path. */
+    (void)pong_backlight_hook_class;
+    (void)pong_backlight_hook_client;
+    static unsigned reported;
+    if ((pong_backlight_hook_count || pong_object_hook_count) &&
+        __atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) == 0) {
+        fprintf(stderr, "Pong backlight18: %u setters, %u client properties forwarded\n",
+            pong_backlight_hook_count, pong_object_hook_count);
+    }
+    /* CoreBrightness may load after this dylib: retry the client hook a few
+     * times instead of failing permanently at construction time. */
+    (void)pong_backlight18_retry; // retired; image callbacks install the checked BKS hooks
+}
+
+/* Whatever UI path the slider takes, CoreBrightness always ends up holding the
+ * user brightness as the "DisplayBrightness"/"Brightness" property.  backboardd
+ * hosts BrightnessSystemInternal, so sampling that property there catches the
+ * value without hooking any private setter, and drives the panel through
+ * pong_backlight_apply(). */
+static id pong_backlight_client;
+static int pong_backlight_client_reported;
+
+static void
+pong_backlight18_poll(void *unused)
+{
+    (void)unused;
+    if (!pong_backlight_client) {
+        Class cls = objc_lookUpClass("BrightnessSystemClient");
+        if (!cls) {
+            if (__atomic_fetch_add(&pong_backlight_client_reported, 1,
+                    __ATOMIC_RELAXED) < 2) {
+                fprintf(stderr, "Pong backlight18: watch has no client class\n");
+            }
+            return;
+        }
+        id instance = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+            sel_registerName("alloc"));
+        instance = ((id (*)(id, SEL))objc_msgSend)(instance,
+            sel_registerName("init"));
+        if (!instance) {
+            if (__atomic_fetch_add(&pong_backlight_client_reported, 1,
+                    __ATOMIC_RELAXED) < 2) {
+                fprintf(stderr, "Pong backlight18: watch client init failed\n");
+            }
+            return;
+        }
+        pong_backlight_client = instance;
+        fprintf(stderr, "Pong backlight18: watch client ready\n");
+    }
+    static const char *const keys[] = { "DisplayBrightness", "Brightness" };
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        CFStringRef name = CFStringCreateWithCString(NULL, keys[i],
+            kCFStringEncodingUTF8);
+        if (!name) {
+            continue;
+        }
+        id value = ((id (*)(id, SEL, id))objc_msgSend)(pong_backlight_client,
+            sel_registerName("copyPropertyForKey:"), (id)name);
+        CFRelease((CFTypeRef)name);
+        if (!value) {
+            continue;
+        }
+        double number = 0;
+        id inner = pong_backlight_number_from(value);
+        if (inner && CFGetTypeID((CFTypeRef)inner) == CFNumberGetTypeID() &&
+            CFNumberGetValue((CFNumberRef)inner, kCFNumberDoubleType, &number)) {
+            pong_backlight_apply((float)number);
+        } else {
+            static unsigned odd;
+            if (__atomic_fetch_add(&odd, 1, __ATOMIC_RELAXED) < 3) {
+                fprintf(stderr, "Pong backlight18: watch %s not numeric\n",
+                    keys[i]);
+            }
+        }
+        CFRelease((CFTypeRef)value);
+        break;
+    }
+}
+
+static void
+pong_backlight18_watch(void)
+{
+    static bool started;
+    if (started) {
+        return;
+    }
+    started = true;
+    dispatch_queue_t queue = dispatch_queue_create("pong.backlight", NULL);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+        0, 0, queue ? queue : dispatch_get_global_queue(0, 0));
+    if (!timer) {
+        fprintf(stderr, "Pong backlight18: watch timer unavailable\n");
+        return;
+    }
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+        250ull * NSEC_PER_MSEC, 50ull * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler_f(timer, pong_backlight18_poll);
+    dispatch_resume(timer);
+    fprintf(stderr, "Pong backlight18: watching CoreBrightness brightness\n");
+}
+
+#include "backlight_bks18.h"
+
 static void wake_home(void *unused)
 {
     (void)unused;
@@ -2187,7 +2876,181 @@ static void keyboard_defaults(void)
     fprintf(stderr,"Pong keyboard: native Pinyin/English/emoji defaults saved=%u\n",saved);
 }
 
+void pong_keyboard_creation18_install(void);
 static bool keyboard_native_scheduled;
+static bool keyboard_soft_scheduled;
+static struct {Class cls;SEL selector;IMP original;} keyboard_soft_setters[4];
+static unsigned keyboard_soft_setter_count;
+static struct {Class cls;SEL selector;IMP original;unsigned logged;} keyboard_flow[12];
+static unsigned keyboard_flow_count;
+static BOOL keyboard_flow_bool_at(id self,SEL selector,unsigned i)
+{
+    IMP original=__atomic_load_n(&keyboard_flow[i].original,__ATOMIC_ACQUIRE);
+    BOOL answer=((BOOL(*)(id,SEL))original)(self,selector);
+    if(__atomic_fetch_add(&keyboard_flow[i].logged,1,__ATOMIC_RELAXED)<8)
+        fprintf(stderr,"Pong keyboard flow: pid=%d %s.%s original=%u\n",getpid(),class_getName(keyboard_flow[i].cls),sel_getName(selector),answer?1:0);
+    return answer;
+}
+static id keyboard_flow_view(id self,SEL selector)
+{
+    const unsigned i=4;
+    IMP original=__atomic_load_n(&keyboard_flow[i].original,__ATOMIC_ACQUIRE);
+    id answer=((id(*)(id,SEL))original)(self,selector);
+    if(__atomic_fetch_add(&keyboard_flow[i].logged,1,__ATOMIC_RELAXED)<8)
+        fprintf(stderr,"Pong keyboard flow: pid=%d keyplaneView=%s\n",getpid(),answer?class_getName(object_getClass(answer)):"nil");
+    return answer;
+}
+#define KEYBOARD_FLOW_BOOL(i) static BOOL keyboard_flow_##i(id self,SEL selector) {return keyboard_flow_bool_at(self,selector,i);}
+KEYBOARD_FLOW_BOOL(0)
+KEYBOARD_FLOW_BOOL(1)
+KEYBOARD_FLOW_BOOL(2)
+KEYBOARD_FLOW_BOOL(3)
+KEYBOARD_FLOW_BOOL(5)
+KEYBOARD_FLOW_BOOL(6)
+KEYBOARD_FLOW_BOOL(7)
+KEYBOARD_FLOW_BOOL(8)
+KEYBOARD_FLOW_BOOL(9)
+KEYBOARD_FLOW_BOOL(10)
+KEYBOARD_FLOW_BOOL(11)
+#undef KEYBOARD_FLOW_BOOL
+static void keyboard_flow_install(void)
+{
+    // Observe the target's original suppression/display answers, not another
+    // forced-success policy. No text, password, responder or surface bytes.
+    const struct {const char *cls,*selector;bool object;} queries[]={
+        {"UIKeyboardImpl","_shouldSuppressSoftwareKeyboard",false},
+        {"UIKeyboardImpl","_shouldSuppressSoftwareKeyboardByOneness",false},
+        {"UIKeyboardImpl","_shouldSuppressSoftwareKeyboardByDictation",false},
+        {"UIKeyboardImpl","isMinimized",false},
+        {"UIKeyboardImpl","keyplaneView",true},
+        {"UIKeyboardVisualModeManager","softwareKeyboardAllowedForActiveKeyboardSceneDelegate",false},
+        {"UIKeyboardVisualModeManager","windowingSoftwareKeyboardAllowed",false},
+        {"UIKeyboardSceneDelegate","keyboardVisible",false},
+        {"UIKeyboardSceneDelegate","isKeyboardOnEmbeddedScreen",false},
+        {"UIKeyboard","inputUIOOP",false},
+        {"UIKeyboardImpl","suppressUpdateLayout",false},
+        {"UIKeyboardImpl","keyboardLayoutIsInAnotherProcess",false}
+    };
+    const IMP wrappers[]={(IMP)keyboard_flow_0,(IMP)keyboard_flow_1,(IMP)keyboard_flow_2,
+        (IMP)keyboard_flow_3,(IMP)keyboard_flow_view,(IMP)keyboard_flow_5,
+        (IMP)keyboard_flow_6,(IMP)keyboard_flow_7,(IMP)keyboard_flow_8,(IMP)keyboard_flow_9,
+        (IMP)keyboard_flow_10,(IMP)keyboard_flow_11};
+    for(unsigned q=0;q<sizeof(queries)/sizeof(queries[0]);q++) {
+        Class cls=objc_lookUpClass(queries[q].cls);if(!cls)continue;
+        if(!strcmp(queries[q].cls,"UIKeyboardVisualModeManager") || !strcmp(queries[q].cls,"UIKeyboard"))cls=object_getClass((id)cls);
+        unsigned count=0;Method *methods=class_copyMethodList(cls,&count);
+        for(unsigned m=0;m<count;m++) {
+            if(strcmp(sel_getName(method_getName(methods[m])),queries[q].selector))continue;
+            if(!method_abi(methods[m],queries[q].object?"@":"Bc",0,""))continue;
+            unsigned i=q;
+            keyboard_flow[i].cls=cls;keyboard_flow[i].selector=method_getName(methods[m]);
+            __atomic_store_n(&keyboard_flow[i].original,method_getImplementation(methods[m]),__ATOMIC_RELEASE);
+            keyboard_flow_count++;
+            method_setImplementation(methods[m],wrappers[q]);
+        }
+        free(methods);
+    }
+    fprintf(stderr,"Pong keyboard flow: observers=%u original answers retained\n",keyboard_flow_count);
+}
+static void keyboard_soft_set_detached(id self,SEL selector,BOOL attached)
+{
+    (void)attached;
+    const unsigned count=__atomic_load_n(&keyboard_soft_setter_count,__ATOMIC_ACQUIRE);
+    for(Class cls=object_getClass(self);cls;cls=class_getSuperclass(cls))
+        for(unsigned i=0;i<count;i++)
+            if(keyboard_soft_setters[i].cls==cls && keyboard_soft_setters[i].selector==selector) {
+                ((void(*)(id,SEL,BOOL))keyboard_soft_setters[i].original)(self,selector,NO);
+                return;
+            }
+}
+static BOOL keyboard_soft_detached(id self,SEL selector)
+{
+    (void)self;
+    static unsigned reported;
+    if(__atomic_fetch_add(&reported,1,__ATOMIC_RELAXED)<4) {
+        fprintf(stderr,"Pong keyboard: softkbd active query=%s -> detached\n",sel_getName(selector));
+    }
+    return NO;
+}
+static void keyboard_soft_install(void *unused)
+{
+    (void)unused;
+    Class cls=objc_lookUpClass("UIKeyboardImpl");
+    if(!cls)return;
+    pong_keyboard_creation18_install();
+    unsigned installed=0;
+    // Actual22H374 metadata names the connection state separately from mode.
+    // Keep native mode/view setters working rather than lying about a view's
+    // existing mode. Only hardware-driven minimization is disabled.
+    const char *classes[]={"UIKeyboardImpl","_UIKeyboardStateManager","UIKeyboard"};
+    for(unsigned kind=0;kind<3;kind++) {
+        Class owner=objc_lookUpClass(classes[kind]);if(!owner)continue;
+        if(kind==2)owner=object_getClass((id)owner);
+        unsigned count=0;Method *methods=class_copyMethodList(owner,&count);
+        for(unsigned i=0;i<count;i++) {
+            const char *name=sel_getName(method_getName(methods[i]));
+            // 99 evidence: every other gate is already healthy and the input
+            // view set is still input=nil. isInHardwareKeyboardMode was the one
+            // state deliberately left original; answer it detached as well.
+            const bool query=!strcmp(name,"hardwareKeyboardAttached") ||
+                (kind==0 && (!strcmp(name,"isHardwareKeyboardAttachedNow") || !strcmp(name,"isInHardwareKeyboardMode") ||
+                             !strcmp(name,"_shouldMinimizeForHardwareKeyboard"))) ||
+                (kind==1 && !strcmp(name,"isInHardwareKeyboardMode")) ||
+                (kind==2 && !strcmp(name,"shouldMinimizeForHardwareKeyboard"));
+            if(query && method_abi(methods[i],"Bc",0,"")) {
+                method_setImplementation(methods[i],(IMP)keyboard_soft_detached);++installed;
+            }
+            const bool setter=(kind==0 && !strcmp(name,"setHardWareKeyboardAttached:")) ||
+                (kind==1 && !strcmp(name,"setHardwareKeyboardAttached:")) ||
+                (kind<2 && !strcmp(name,"setAutomaticMinimizationEnabled:"));
+            if(setter && method_abi(methods[i],"v",1,"B") && keyboard_soft_setter_count<4) {
+                const unsigned at=keyboard_soft_setter_count;
+                keyboard_soft_setters[at].cls=owner;
+                keyboard_soft_setters[at].selector=method_getName(methods[i]);
+                keyboard_soft_setters[at].original=method_getImplementation(methods[i]);
+                __atomic_store_n(&keyboard_soft_setter_count,at+1,__ATOMIC_RELEASE);
+                method_setImplementation(methods[i],(IMP)keyboard_soft_set_detached);
+            }
+        }
+        free(methods);
+    }
+    // If a keyboard already exists, refresh its real state and rebuild it.
+    // activeInstance avoids creating a detached replacement keyboard object.
+    SEL active=sel_registerName("activeInstance");
+    unsigned rebuilt=0;
+    if(installed && method_abi(class_getClassMethod(cls,active),"@",0,"")) {
+        id keyboard=((id(*)(id,SEL))objc_msgSend)((id)cls,active);
+        SEL attached=sel_registerName("setHardWareKeyboardAttached:");
+        SEL automatic=sel_registerName("setAutomaticMinimizationEnabled:");
+        SEL mode=sel_registerName("setInHardwareKeyboardMode:forceRebuild:");
+        if(keyboard && method_abi(class_getInstanceMethod(cls,attached),"v",1,"B") &&
+           method_abi(class_getInstanceMethod(cls,automatic),"v",1,"B") &&
+           method_abi(class_getInstanceMethod(cls,mode),"v",2,"BB")) {
+            ((void(*)(id,SEL,BOOL))objc_msgSend)(keyboard,attached,NO);
+            ((void(*)(id,SEL,BOOL))objc_msgSend)(keyboard,automatic,NO);
+            ((void(*)(id,SEL,BOOL,BOOL))objc_msgSend)(keyboard,mode,NO,YES);rebuilt=1;
+        }
+    }
+    fprintf(stderr,"Pong keyboard: softkbd69 %s queries=%u nativeSetters=%u rebuilt=%u; HID input unchanged\n",
+        installed?"installed":"SKIP",installed,keyboard_soft_setter_count,rebuilt);
+    keyboard_flow_install();
+}
+static void keyboard_soft_image(const struct mach_header *header,intptr_t slide)
+{
+    (void)header;(void)slide;
+    if(keyboard_soft_scheduled || !objc_lookUpClass("UIKeyboardImpl"))return;
+    keyboard_soft_scheduled=true;
+    dispatch_async_f(dispatch_get_main_queue(),NULL,keyboard_soft_install);
+}
+static void keyboard_soft_start(void)
+{
+    char args[1100]={0};size_t length=sizeof(args)-1;
+    if(sysctlbyname("kern.bootargs",args,&length,NULL,0))return;
+    bool enabled=false;
+    for(char *word=strtok(args," ");word;word=strtok(NULL," "))
+        if(!strcmp(word,"softkbd=1"))enabled=true;
+    if(enabled)_dyld_register_func_for_add_image(keyboard_soft_image);
+}
 static bool keyboard_phone_installed;
 static void keyboard_retire_old_images(void)
 {
@@ -2267,7 +3130,14 @@ __attribute__((constructor)) static void pong_ui18_start(void)
 {
     const char *name=getprogname();
     if(!name)return;
+    if(boot_option("softkbd=1"))
+        fprintf(stderr,"Pong UI18: image pid=%d prog=%s; softkbd policy active\n",getpid(),name);
+    keyboard_soft_start();
     if(!strcmp(name,"InputUI")) {
+        if(boot_option("softkbd=1"))pong_boot_snapshot_start(name);
+        // 97: no layout/factory probe fired in SpringBoard, so the keyboard is
+        // hosted here. Observe only; no behavior change.
+        pong_keyboard_creation18_install();
         char product[32]={};size_t length=sizeof(product);
         if(!sysctlbyname("hw.product",product,&length,NULL,0) && !strcmp(product,"iPhone17,1"))
             _dyld_register_func_for_add_image(keyboard_phone_image);
@@ -2296,6 +3166,8 @@ __attribute__((constructor)) static void pong_ui18_start(void)
     wallpaper_process=boot_option("pong_wallpaper_catalog_override=1") && wallpaper_paths_process;
     (void)dup2(2,1);setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);
     fprintf(stderr,"Pong iPadOS18 adapter: %s (22H374)\n",name);
+    if (!strcmp(name,"Preferences") || !strcmp(name,"SpringBoard"))
+        _dyld_register_func_for_add_image(pong_bks_image);
     if(!strcmp(name,"wifid")) {
         if(boot_option("pong_boot_snapshot=1"))pong_boot_snapshot_start(name);
         return;
@@ -2310,7 +3182,11 @@ __attribute__((constructor)) static void pong_ui18_start(void)
         _dyld_register_func_for_add_image(context_motion_image);
         return;
     }
-    if(strcmp(name,"Preferences")==0)pong_settings18_start();
+    if(strcmp(name,"Preferences")==0) {
+        pong_settings18_start();
+        /* The Settings slider is the one that can be dragged on this port. */
+        pong_backlight18_start();
+    }
     // Keep SpringBoard/compositor adapters out of the poster renderer.
     // Only its native storage path and single-user identity are adapted.
     if(!strcmp(name,"PosterBoard")){
@@ -2345,6 +3221,7 @@ __attribute__((constructor)) static void pong_ui18_start(void)
         // Physical volume keys stay on the native HID/system event route.
         skip_setup=boot_option("pong_skip_setup=1");
         CFPreferencesSetAppValue(CFSTR("SBDisableAutoDim"),kCFBooleanTrue,kCFPreferencesCurrentApplication);
+        pong_backlight18_start();
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_main_queue(),NULL,wake_home);
     }
     if(strcmp(name,"backboardd")==0) {
@@ -2353,6 +3230,9 @@ __attribute__((constructor)) static void pong_ui18_start(void)
         backboard_container();
         _dyld_register_func_for_add_image(brightness18_image);
         pong_touch_start();
+        pong_backlight18_start();
+        (void)pong_backlight_dump_classes;
+        (void)pong_backlight18_watch;
     }
     _dyld_register_func_for_add_image(compositor_image);
     if(boot_option("pong_boot_snapshot=1"))pong_boot_snapshot_start(name);

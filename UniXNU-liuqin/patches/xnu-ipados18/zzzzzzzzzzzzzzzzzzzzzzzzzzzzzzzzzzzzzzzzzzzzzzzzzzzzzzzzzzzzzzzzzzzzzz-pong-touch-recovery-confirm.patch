@@ -1,0 +1,94 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -4780,6 +4780,32 @@
+  * ever validating means the reads race its writes. */
+ static unsigned tch_evt_changes;
+ static uint8_t tch_evt_head[8];
++/* Recovery completion needs a real report, not just RESET_COMPLETE=0xa0.
++ * Count a bounded, in-range contact or the normal all-FF empty record area.
++ * The boot placeholder FF/00 and the FD/FE watchdog fill confirm neither. */
++static unsigned tch_good_reports;
++static unsigned tch_watchdog_report;
++
++static void
++tch_report_health(const uint8_t *frame)
++{
++	bool healthy = false, empty = true, watchdog = true;
++	for (unsigned i = 0; i < 6; i++) {
++		if (frame[i] != 0xfd && frame[i] != 0xfe) watchdog = false;
++	}
++	for (int i = 0; i < NVT_MAX_FINGERS; i++) {
++		const unsigned id = tch_rec_id(frame, i), event = tch_rec_event(frame, i);
++		if (id >= 1 && id <= NVT_MAX_FINGERS && (event == 1 || event == 2) &&
++		    tch_rec_x(frame, i) <= tch.max_x && tch_rec_y(frame, i) <= tch.max_y)
++			healthy = true;
++	}
++	for (unsigned i = 0; i < 6 * NVT_MAX_FINGERS; i++) {
++		if (frame[i] != 0xff) { empty = false; break; }
++	}
++	__atomic_store_n(&tch_watchdog_report, watchdog, __ATOMIC_RELEASE);
++	if (healthy || empty)
++		(void)__atomic_add_fetch(&tch_good_reports, 1, __ATOMIC_RELEASE);
++}
+ 
+ static bool
+ tch_evt_changed(const uint8_t *a, uint8_t *b)
+@@ -4935,7 +4961,7 @@
+ 				    tch.last_irq, tch.dma_tx_status, tch.dma_rx_status);
+ 			}
+ 		} else if (tch_evt_changed(frame, prevbuf), tch_evt_reads++,
+-		    tch_frame_streak(frame, int_edge),
++		    tch_report_health(frame), tch_frame_streak(frame, int_edge),
+ 		    !tch_frame_valid(frame) && evt_logs < 12 &&
+ 		    memcmp(frame, last, sizeof(frame)) != 0) {
+ 			evt_logs++;
+@@ -5209,6 +5235,9 @@
+ 	unsigned last_frames = 0;
+ 	unsigned tch_quiet_checks = 0;
+ 	unsigned keepalive_ms = 0;
++	bool recovery_pending = false;
++	unsigned recovery_baseline = 0, recovery_attempts = 0;
++	uint64_t recovery_due = 0;
+ 	unsigned idle_recover_s = 0; /* no contact during idle is normal, not a hang */
+ 	(void)PE_parse_boot_argn("liuqinidle_recover", &idle_recover_s, sizeof(idle_recover_s));
+ 
+@@ -5281,7 +5310,23 @@
+ 		} else {
+ 			last_frames = tch_valid_frames;
+ 			tch_quiet_checks = 0;
++		}
++		if (recovery_pending) {
++			if (__atomic_load_n(&tch_good_reports, __ATOMIC_ACQUIRE) != recovery_baseline) {
++				printf("LIUQIN TOUCH: recovery confirmed by a normal report after %u attempts\n",
++				    recovery_attempts);
++				recovery_pending = false;
++				recovery_attempts = 0;
++			} else if (mach_absolute_time() >= recovery_due &&
++			    __atomic_load_n(&tch_watchdog_report, __ATOMIC_ACQUIRE)) {
++				/* A previously confirmed watchdog fault has not recovered.
++				 * No new IRQ is required; ordinary idle alone never enters here. */
++				printf("LIUQIN TOUCH: recovery unconfirmed: FD/FE persists after attempt %u; retrying\n",
++				    recovery_attempts);
++				tch_fw_dead = 1;
++			}
+ 		}
+-		if (tch_fw_dead && tch_fw_revive < TCH_REVIVE_MAX) {
++		if (tch_fw_dead && tch_fw_revive < TCH_REVIVE_MAX &&
++		    (!recovery_pending || mach_absolute_time() >= recovery_due)) {
+ 			tch_fw_revive++;
+ 			printf("LIUQIN TOUCH: revive %u: interrupts without a frame, "
+@@ -5313,6 +5358,14 @@
+ 				    b[0], b[1], b[2], b[3], tch_fw_status_byte(),
+ 				    tch_panel_running() ? "running" : "not ready");
+ 			}
++			/* Polling resumes, but BOOTED is not yet a recovery verdict.
++			 * Retry only a retained watchdog fault: 15, 30, then 60 s gaps. */
++			recovery_pending = true;
++			recovery_baseline = __atomic_load_n(&tch_good_reports, __ATOMIC_ACQUIRE);
++			if (recovery_attempts != ~0u) recovery_attempts++;
++			const unsigned retry_s = recovery_attempts == 1 ? 15 : recovery_attempts == 2 ? 30 : 60;
++			clock_interval_to_deadline(retry_s, NSEC_PER_SEC, &recovery_due);
++			printf("LIUQIN TOUCH: recovery awaiting normal report; retry gap %u s\n", retry_s);
+ 			tch_fw_dead = 0;
+ 			tch_hang_hits = 0;
+ 			tch_quiet_checks = 0;

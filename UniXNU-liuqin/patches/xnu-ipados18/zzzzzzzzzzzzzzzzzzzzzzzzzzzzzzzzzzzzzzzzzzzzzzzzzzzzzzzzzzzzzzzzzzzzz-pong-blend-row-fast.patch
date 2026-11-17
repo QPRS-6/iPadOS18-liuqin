@@ -1,0 +1,37 @@
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -450,6 +450,25 @@
+ 	const uint32_t b = ((s & 0xff) * a + (d & 0xff) * ia) / 255;
+ 
+ 	*to = 0xff000000u | r << 16 | g << 8 | b;
++}
++
++/* Common BGRA rows are opaque; copy four pixels together instead of doing
++ * a read/modify/write on WC scanout memory for every pixel. Mixed-alpha rows
++ * retain the exact existing scalar equation. No kernel SIMD state is used. */
++static void
++pongBlendRow(uint32_t *to, const uint32_t *from, uint32_t count)
++{
++	while (count >= 4) {
++		uint32_t all = from[0] & from[1] & from[2] & from[3];
++		uint32_t any = from[0] | from[1] | from[2] | from[3];
++		if ((all >> 24) == 255) {
++			memcpy(to, from, 4 * sizeof(uint32_t));
++		} else if (any >> 24) {
++			for (unsigned i = 0; i < 4; i++) pongBlendPixel(to + i, from[i]);
++		}
++		to += 4; from += 4; count -= 4;
++	}
++	while (count--) pongBlendPixel(to++, *from++);
+ }
+ 
+ static inline uint64_t
+@@ -914,7 +933,7 @@
+ 			if (!gPongBlend) {
+ 				for (int32_t x=0;x<sw;x++) to[px0+x]=row[x] | 0xff000000u;
+ 			} else {
+-				for (int32_t x=0;x<sw;x++) pongBlendPixel(to + px0 + x, row[x]);
++				pongBlendRow(to + px0, row, (uint32_t)sw);
+ 			}
+ 			continue;
+ 		}

@@ -4,7 +4,7 @@
 Firmware is read from the user's local recovery extraction, embedded only in
 ignored build output, never committed here. No images are hashed/read back.
 """
-import argparse,importlib.util,json,os,struct,subprocess,sys
+import argparse,importlib.util,json,os,re,struct,subprocess,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
@@ -16,7 +16,7 @@ def main():
  p.add_argument('--firmware',type=Path,default=pong_paths.wifi_firmware())
  a=p.parse_args();out=a.tree/'build/pong-wifi';out.mkdir(parents=True,exist_ok=True)
  shared=pong_paths.sheng_root()
- profile=json.loads((ROOT/'configs/pong-wifi-sm8475.json').read_text())
+ profile=json.loads(Path(os.environ.get('PONG_WIFI_PROFILE',ROOT/'configs/pong-wifi-sm8475.json')).read_text())
  if profile['soc']!='SM8475' or profile['pci']['device']!=0x1103:raise RuntimeError('Pong QCA6490 profile required')
  hardware=os.environ.get('PONG_HARDWARE_DTB')
  if hardware:
@@ -39,8 +39,7 @@ def main():
  header='struct PongWifiPhyEntry {unsigned off,value,delay;};\nstatic constexpr PongWifiPhyEntry kPongWifiPhy[]={\n'+''.join('{%d,%d,%d},\n'%tuple(e) for e in profile['pcie']['phy_sequence'])+'};\n'
  header+='struct PongWifiRail {const char *name;unsigned mv,maxMv,ppid,type,subtype;};\nstatic constexpr PongWifiRail kPongWifiRails[]={\n'
  for e in profile['rails']:
-  physical=e.get('physical',{})
-  ppid=(physical.get('spmi_slave',0)<<8)|physical.get('peripheral',0)
+  physical=e.get('physical',{});ppid=(physical.get('spmi_slave',0)<<8)|physical.get('peripheral',0)
   header+='{%s,%d,%d,%d,%d,%d},\n'%(json.dumps(e['resource']),(e['request'][0]+999)//1000,e['request'][1]//1000,ppid,physical.get('type',0),physical.get('subtype',0))
  for e in profile['pcie']['analogue_rails']:
   header+='{%s,%d,%d,0,0,0},\n'%(json.dumps(e['resource']),(e['microvolts']+999)//1000,e['microvolts']//1000)
@@ -61,7 +60,9 @@ def main():
   header+='static constexpr unsigned %s=%du;\n'%(name,value)
 
  (out/'PongWifiInputs.h').write_text(header)
- fw=sorted(f for f in a.firmware.iterdir() if f.is_file())
+ fw=sorted(f for f in a.firmware.iterdir() if f.is_file() and
+   (f.name in ('amss.bin','amss20.bin','m3.bin','regdb.bin') or
+    re.fullmatch(r'bdwlan(?:g|[0-9a-f]{2})?\.(?:elf|e[0-9a-f]{2})',f.name)))
  if not all((a.firmware/n).is_file() for n in ('amss.bin','amss20.bin','m3.bin','regdb.bin')):raise RuntimeError('Actual Pong modem firmware required')
  entries=[];at=(8+len(fw)*40+4095)&~4095
  for f in fw:

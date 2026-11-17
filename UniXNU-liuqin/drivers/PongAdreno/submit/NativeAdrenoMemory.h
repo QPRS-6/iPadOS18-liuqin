@@ -112,7 +112,9 @@ public:
     void quarantine() {quarantined_=true;}
     /* Requires real CPU/device exclusion and retained ownership. Before GPU
      * writes, clean+invalidate; after genuine completion, invalidate only.
-     * CPU must not dirty these pages while the device owns access. */
+     * CPU must not dirty these pages while the device owns access.
+     * offset and bytes must describe whole owned4KiB pages, including WC
+     * objects. A sub-page GPU write still requires an aligned page range. */
     /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
     IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);

@@ -1,0 +1,90 @@
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -307,12 +307,13 @@
+ };
+ 
+ struct tu_virtio_device;
++class tu_darwin_backend;
+ 
+ struct tu_device
+ {
+    struct vk_device vk;
+    struct tu_instance *instance;
+-   void *darwin_retire; /* Darwin KMD's bounded deferred BO retirement state. */
++   tu_darwin_backend *darwin; /* This logical device owns its native connection/state. */
+ 
+    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
+    int queue_count[TU_MAX_QUEUE_FAMILIES];
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -61,8 +61,9 @@
+ #ifdef TU_HAS_DARWIN
+-   /* The NativeAdreno kernel client's buffer handle (64 bit, gem_handle is its low half) and the token that selects its
+-    * CPU mapping (IOConnectMapMemory64 memory type). */
+-   uint64_t darwin_handle;
++   /* Native ownership is scoped to a logical device, including failed CPU views. */
++   uint64_t darwin_handle, darwin_owner;
+    uint32_t darwin_token;
++   void *darwin_failed_map;
++   bool darwin_imported;
+ #endif
+ 
+    bool implicit_sync : 1;
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -139,7 +139,10 @@
+ 
+ if freedreno_kmds.contains('darwin')
+   tu_flags += '-DTU_HAS_DARWIN'
+-  libtu_files += files('tu_knl_darwin.cc', 'tu_builtin_cache.cc')
++  libtu_files += files('tu_knl_darwin.cc', 'tu_builtin_cache.cc',
++    'tu_darwin_connection.cc', 'tu_darwin_backend.cc', 'tu_darwin_sync.cc',
++    'tu_darwin_iokit.cc', 'tu_darwin_memory.cc', 'tu_darwin_mesa_sync.cc',
++    'tu_darwin_submit.cc')
+   tu_flags += '-DTU_BUILTIN_SOURCE_ID="' + get_option('tu-builtin-source-id') + '"'
+   if get_option('tu-builtin-pack-header') != ''
+     tu_flags += '-DTU_BUILTIN_PACK_HEADER="' + get_option('tu-builtin-pack-header') + '"'
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -441,8 +441,10 @@
+ 
+    VkResult result =
+       tu_insert_dynamic_cmdbufs(device, &cmd_buffers, &cmdbuf_count);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
+       return result;
++   }
+ 
+    bool has_trace_points = false;
+    static_assert(offsetof(struct tu_cmd_buffer, vk) == 0,
+@@ -455,19 +457,26 @@
+    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
+ 
+    void *submit = tu_submit_create(device);
+-   if (!submit)
++   if (!submit) {
++      result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      pthread_mutex_unlock(&device->submit_mutex);
+       goto fail_create_submit;
++   }
+ 
+    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
+       goto out;
++   }
+ 
+    result = resolve_cb_control_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+ 
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
+       goto out;
++   }
+ 
+    if (has_trace_points) {
+       tu_u_trace_submission_data_create(

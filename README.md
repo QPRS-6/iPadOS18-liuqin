@@ -15,8 +15,8 @@ iPadOS18-liuqin/
   UniXNU-liuqin/        device repository: kernel drivers, XNU patch series,
                         userland, build kits, board config (board.toml,
                         configs/liuqin-board.json, dts/liuqin.dts, porting.toml);
-                        build and directory guides in docs/BUILD.zh.md and
-                        docs/LAYOUT.zh.md
+                        build, directory and hardware-audit notes under docs/
+                        (BUILD.zh.md, LAYOUT.zh.md, BACKLIGHT-AUDIT.zh.md, …)
   UniXNU-sheng/         shared Sheng package sources the device build links
                         (QcomRpmh, AppleARMBacklight reference, probes)
   metal/
@@ -68,7 +68,7 @@ cargo build --release --target aarch64-apple-ios --features ipados18
 `Cargo.toml` currently carries the author's absolute paths for the frontend
 object and the local `metal2vulkan` checkout; adjust them for your tree.
 
-## Device status at the time of this drop (2026-11-10)
+## Device status at the time of this drop (2026-11-17)
 
 Verified on hardware:
 
@@ -81,40 +81,52 @@ Verified on hardware:
   Ordinary panics still stay on screen (the hook declines once a panic began).
 - Metal renders through the Adreno 730 path; GPU stability work is ongoing.
 
-Not enabled yet:
+Still in progress:
 
-- KTZ8866 brightness control. `drivers/PongPower/PongBacklightKtz.cpp` and the
-  `pong-i2c-backlight` ADT property exist, but every kernel built with that
-  object linked panicked on boot, so the shipped kernel keeps
-  `CONFIG_XNU_PONG_POWER=n` / `CONFIG_XNU_PONG_BACKLIGHT=n`.
-- Battery, sensors, stylus, audio, Bluetooth and Wi-Fi remain work in progress;
-  see `UniXNU-liuqin/porting.toml`.
+- KTZ8866 brightness control: the device defconfig now builds it
+  (`CONFIG_XNU_PONG_BACKLIGHT=y`). The chip answers on i2c1 and the volume keys
+  change the panel level, but the BackBoardServices settings slider is still
+  ineffective — see `UniXNU-liuqin/docs/BACKLIGHT-AUDIT.zh.md`.
+  `CONFIG_XNU_PONG_POWER` stays off.
+- Battery, audio, Wi-Fi and the sensor set remain work in progress; Bluetooth,
+  pen and keyboard input are now in-tree but still being brought up. See
+  `UniXNU-liuqin/porting.toml`.
 
-## Changes in the 2026-11-10 refresh
+## Changes in the 2026-11-17 refresh
 
-Nineteen files in `UniXNU-liuqin/` (5 added, 14 modified) on top of the
-previous drop — display path, build docs and the touch driver:
+194 files in `UniXNU-liuqin/` (140 added, 54 modified, none deleted) over three
+commits on the `liuqin` branch, ending at `63e1729` — GPU, input, power and
+userland runtime work:
 
-- `pong_fb_flip`: double-buffered scanout. Each frame is written into the
-  buffer the display pipe is not fetching, the pipe's source address is
-  repointed and the control path flushed; after three flips that are not taken
-  it falls back to the boot loader's buffer. Ported from HakiOS/mayfly
-  (`fb_flip`) — `patches/xnu-ipados18/…-pong-fb-flip.patch`.
-- `pong_fb_blend` (same patch, default 1): kernel composition blends by real
-  alpha instead of forcing every pixel opaque, which removes the colour bars
-  where a composited sheet carries uninitialised RGB behind transparent pixels.
-- Scanout fallback: `SWAP_GPU_MS` raised 500 → 1000 ms, and when no GPU frame
-  completed the CPU composition path is permitted again instead of returning
-  `kIOReturnNotReady` (`pong_scanout_fallback`) — `…-pong-scanout-fallback.patch`.
-- `pong-io-map-64m`: the kernel I/O map window grows from 8 MB to 64 MB
-  (`osfmk/arm/io_map.c`).
-- GPU presenters reworked: `GpuScanoutPresenter.h` copies pitched BGRA rows in
-  one dispatch and supplies opaque alpha upstream; scanout and submit paths
-  (`PongAdrenoScanout.cpp`, `NativeAdreno{Publish,Submit}.cpp`), UFS transport
-  and the NT36532 touch patch updated as well.
-- New `docs/BUILD.zh.md` (from-zero build) and `docs/LAYOUT.zh.md` (directory
-  map); the device README gained a full acknowledgement list of the upstream
-  components this port derives from.
+- Turnip gains an in-tree Darwin backend: `drivers/PongAdreno/turnip/tu_darwin_*.cc`
+  submits to the Adreno user client directly, paired with the Mesa-side half in
+  `patches/mesa/0064-pong-darwin-backend-v2-integration.patch`. The same area
+  carries pvtmem transactional growth (0059), suballoc failure ownership (0060),
+  the active device lease (0062), allocation-failure evidence (0063) and
+  imported GMEM edges plus scoped memory pressure (0066), with QoS idle
+  placement (0003) and bounded oslog replay (0004).
+- Touch and native input: recovery policy/confirm, fault history, full report,
+  autocopy status, startup confirm and SPI-timing patches; the new
+  `drivers/PongInputNative` and the native-input entry patch.
+  `docs/TOUCH-PREVIEW-PERF.zh.md` traces the firmware-redownload storm behind
+  the long input stalls.
+- Bluetooth: new `drivers/PongBluetooth` (HID user client, exit-PC and
+  user-fault tracing, ZBT snapshots), the `QcaBluetooth` `qbt_transport` source
+  pinned in `configs/pong-native-sources.toml`, a userland bootstrap, and the
+  legacy-to-extended LE translation with IOHIDFamily prelink.
+- Pen and keyboard: static reversal of the Oplus system daemon in
+  `docs/OPLUS-PEN-RE.zh.md`, `userland/PongPenEvent.h`, keyboard
+  creation/preferences and the input/UI job scripts.
+- Power: KTZ8866 backlight is compiled in; `docs/BACKLIGHT-AUDIT.zh.md` records
+  the chip's device evidence and the BackBoardServices path that still defeats
+  the settings slider. Battery/ADSP-GLINK work is written up in
+  `docs/BATTERY-LIUQIN.zh.md`.
+- Also in this drop: CPU placement policy in `drivers/ArmCpu`, UFS log policy,
+  Metal app diagnostics, and new docs — `INPUTS.zh.md` (what must be fetched
+  locally), `NATIVE-INPUT-PHOTO.zh.md`, plus updated BUILD/LAYOUT guides.
+
+The previous refresh (2026-11-10: `pong_fb_flip` double buffering,
+`pong_fb_blend`, scanout fallback, 64 MB kernel I/O map) is in git history.
 
 ## Licensing
 

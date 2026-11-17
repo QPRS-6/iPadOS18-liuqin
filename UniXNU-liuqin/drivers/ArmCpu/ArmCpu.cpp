@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 #if PONG_DARWIN_MAJOR >= 24
 #include "PongCpuPolicy.h"
+#include "PongCpuPlacement.h"
 #endif
 
 extern "C" void rtclock_intr(unsigned int);
@@ -35,6 +36,17 @@ volatile uint64_t armcpu_pac_features[8][3];
 }
 
 #if PONG_DARWIN_MAJOR >= 24
+/* Each CPU records its own identity after XNU has established the logical ID.
+ * Zero means not observed on that CPU; consumers must not guess from Android IDs. */
+static uint32_t gCpuMidr[8];
+static uint64_t gCpuMpidr[8];
+static uint64_t gCpuPlacementKinds[3],gCpuPlacementPicks[3];
+static uint32_t gCpuQosMode,gCpuQosReports;
+extern "C" uint32_t pong_cpu_midr(unsigned cpu)
+{
+  return cpu<8 ? __atomic_load_n(&gCpuMidr[cpu],__ATOMIC_ACQUIRE) : 0;
+}
+
 /* Pure scheduler hint: logical IDs follow the selected Pong DT's sorted
  * MPIDRs. Keep the 4+3+1 board knowledge out of the generic scheduler.
  * An occupied/offline/unrecommended core is absent from the supplied map;
@@ -44,6 +56,22 @@ extern "C" uint64_t pong_cpu_preferred_idle_mask(uint64_t available)
   if (available & (1ULL << 7)) return available & (1ULL << 7); // Cortex-X2
   if (available & 0x70ULL) return available & 0x70ULL;         // Cortex-A710
   return available;                                         // Cortex-A510
+}
+extern "C" uint64_t pong_cpu_preferred_idle_class(uint64_t available,unsigned demand)
+{
+  if(__atomic_load_n(&gCpuQosMode,__ATOMIC_ACQUIRE)!=1)return pong_cpu_preferred_idle_mask(available);
+  if(available && demand<3)__atomic_fetch_add(&gCpuPlacementPicks[demand],1,__ATOMIC_RELAXED);
+  return pongCpuPlacement(available,gCpuPlacementKinds,demand);
+}
+// Called from the framebuffer's ordinary report context, never scheduler locks.
+extern "C" void pong_cpu_qos_report(void)
+{
+  if(__atomic_load_n(&gCpuQosMode,__ATOMIC_ACQUIRE)!=1 ||
+      __atomic_fetch_add(&gCpuQosReports,1,__ATOMIC_RELAXED)>=3)return;
+  IOLog("ArmCpu: cpuq selections background=%llu normal=%llu latency=%llu\n",
+      __atomic_load_n(&gCpuPlacementPicks[0],__ATOMIC_RELAXED),
+      __atomic_load_n(&gCpuPlacementPicks[1],__ATOMIC_RELAXED),
+      __atomic_load_n(&gCpuPlacementPicks[2],__ATOMIC_RELAXED));
 }
 #endif
 
@@ -362,14 +390,29 @@ bool ArmCpu::start(IOService *provider)
   for (unsigned i=0; i<ml_get_cpu_count(); i++) {
     if (gCpus[i] != this) pong_cpu_first_boot(gCpus[i]->machProcessor);
   }
+  uint32_t fbMid=0;
+  PE_parse_boot_argn("fb_mid",&fbMid,sizeof(fbMid));
   for (unsigned i=0; i<ml_get_cpu_count(); i++) {
     pong_cpu_first_boot_wait(gCpus[i]->machProcessor);
     IOLog("ArmCpu: CPU %u first boot completed\n", i);
+    if(fbMid) IOLog("ArmCpu: CPU %u identity MIDR=%#x MPIDR=%#llx\n",
+        i,pong_cpu_midr(i),__atomic_load_n(&gCpuMpidr[i],__ATOMIC_RELAXED));
     const uint64_t isar1=armcpu_pac_features[i][0],isar2=armcpu_pac_features[i][1];
     const bool address=((isar1>>4)&15) || ((isar1>>8)&15) || ((isar2>>12)&15);
     const bool generic=((isar1>>24)&15) || ((isar1>>28)&15) || ((isar2>>8)&15);
     IOLog("ArmCpu: CPU %u PAC features ISAR1=%#llx ISAR2=%#llx SCTLR=%#llx address=%u generic=%u key-access=not-probed\n",
         i,isar1,isar2,armcpu_pac_features[i][2],address,generic);
+  }
+  uint32_t cpuq=0;
+  PE_parse_boot_argn("cpuq",&cpuq,sizeof(cpuq));
+  if(cpuq==1) {
+    for(unsigned i=0;i<ml_get_cpu_count() && i<8;i++) {
+      const int kind=pongCpuKind(pong_cpu_midr(i));
+      if(kind>=0)gCpuPlacementKinds[kind]|=1ULL<<i;
+    }
+    __atomic_store_n(&gCpuQosMode,1,__ATOMIC_RELEASE);
+    IOLog("ArmCpu: cpuq=1 idle topology A510=%#llx A710=%#llx X2=%#llx; QoS/priority placement\n",
+        gCpuPlacementKinds[0],gCpuPlacementKinds[1],gCpuPlacementKinds[2]);
   }
   ml_cpu_init_completed();
 #else
@@ -401,7 +444,7 @@ bool ArmCpu::start(IOService *provider)
       ctl, cval, now, frequency, daif, armcpu_timer_interrupts);
 #if PONG_DARWIN_MAJOR >= 24
   PongCpuPolicy::start();
-  IOLog("ArmCpu: all registered CPUs available; idle preference X2, A710, A510 (no affinity binding)\n");
+  IOLog("ArmCpu: all registered CPUs available; global idle preference X2, A710, A510\n");
 #endif
   return true;
 }
@@ -409,6 +452,15 @@ bool ArmCpu::start(IOService *provider)
 void ArmCpu::initCPU(bool boot)
 {
   (void)boot; // XNU passes true for the first initialization of each CPU.
+#if PONG_DARWIN_MAJOR >= 24
+  if(logicalId<8 && ml_get_cpu_number_local()==logicalId) {
+    uint64_t midr,mpidr;
+    __asm__ volatile("mrs %0, midr_el1":"=r"(midr));
+    __asm__ volatile("mrs %0, mpidr_el1":"=r"(mpidr));
+    __atomic_store_n(&gCpuMpidr[logicalId],mpidr,__ATOMIC_RELAXED);
+    __atomic_store_n(&gCpuMidr[logicalId],static_cast<uint32_t>(midr),__ATOMIC_RELEASE);
+  }
+#endif
   if(logicalId<8) {
     uint64_t isar1,isar2,sctlr;
     __asm__ volatile("mrs %0, id_aa64isar1_el1":"=r"(isar1));

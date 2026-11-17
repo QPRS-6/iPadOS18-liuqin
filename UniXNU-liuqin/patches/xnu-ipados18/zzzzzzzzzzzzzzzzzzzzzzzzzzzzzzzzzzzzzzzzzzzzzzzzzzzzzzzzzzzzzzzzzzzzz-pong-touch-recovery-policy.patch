@@ -1,0 +1,105 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -3228,7 +3228,6 @@
+ 	return v;
+ }
+ 
+-static unsigned tch_status_clears;
+ /* touch176: driving the controller's INT pin from the host is opt-in. */
+ static bool tch_int_poke_ok;
+ 
+@@ -4540,7 +4540,7 @@
+  * makes is ours, not a report from the controller, and must not decide a
+  * firmware hang (the keep-alive poke was reloading the firmware every few
+  * seconds that way). */
+-static volatile unsigned tch_poke_grace;
++static uint64_t tch_poke_grace_until;
+ /*
+  * touch181: the budget was 10, and every revive costs about 3 s of download
+  * plus the 30 s wait that triggers it - which is why "touch dies after 7-8
+@@ -4643,12 +4643,16 @@
+ static bool
+ tch_int_wake(void)
+ {
++	if (tch_fw_active || !tch_spi_acquire()) return false;
++	uint64_t grace;
++	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &grace);
++	__atomic_store_n(&tch_poke_grace_until, grace, __ATOMIC_RELEASE);
+ 	tch_bb_dir(21, true, 0);
+ 	delay(200);
+ 	tch_bb_dir(21, false, 0);
+ 	tch_wr(tch.tlmm, TLMM_CTL(21), (0u << 2) | (3u << 6));   /* mux 0 (GPIO), pull-up, input */
+-	tch_poke_grace = 100;
+ 	delay(1000);
++	tch_spi_release();
+ 	return false;
+ }
+ 
+@@ -4723,10 +4727,8 @@
+ static void
+ tch_frame_streak(const uint8_t *frame, bool int_edge)
+ {
+-	if (tch_poke_grace) {
+-		tch_poke_grace--;
+-		if (int_edge) return;
+-	}
++	if (int_edge && mach_absolute_time() <
++	    __atomic_load_n(&tch_poke_grace_until, __ATOMIC_ACQUIRE)) return;
+ 	if (tch_frame_valid(frame)) {
+ 		tch_hang_hits = 0;
+ 		return;
+@@ -4734,7 +4736,15 @@
+ 	if (!int_edge) {
+ 		return;
+ 	}
+-	if (++tch_hang_hits >= 3) {
++	/* Only the vendor's six-byte FD/FE watchdog signature counts. A lift,
++	 * torn SPI sample or other malformed packet is not a CRC failure. */
++	for (unsigned i = 0; i < 6; i++) {
++		if (frame[i] != 0xfd && frame[i] != 0xfe) {
++			tch_hang_hits = 0;
++			return;
++		}
++	}
++	if (++tch_hang_hits >= 10) {
+ 		tch_hang_hits = 0;
+ 		/*
+ 		 * touch175: before paying for a whole re-download, give the firmware
+@@ -4759,7 +4769,7 @@
+ 				return;
+ 			}
+ 		}
+-		printf("LIUQIN TOUCH: three interrupts with 0xFD in the report area: the "
++		printf("LIUQIN TOUCH: ten watchdog interrupts with 0xFD/0xFE: the "
+ 		    "firmware is stuck (vendor's CRC-fail loop pattern), %u valid "
+ 		    "frames so far\n", tch_valid_frames);
+ 		tch_fw_dead = 1;
+@@ -5200,6 +5210,8 @@
+ 	unsigned last_frames = 0;
+ 	unsigned tch_quiet_checks = 0;
+ 	unsigned keepalive_ms = 0;
++	unsigned idle_recover_s = 0; /* no contact during idle is normal, not a hang */
++	(void)PE_parse_boot_argn("liuqinidle_recover", &idle_recover_s, sizeof(idle_recover_s));
+ 
+ 	(void)PE_parse_boot_argn("liuqinrecover", &level, sizeof(level));
+ 	if (level <= 0) {
+@@ -5257,7 +5269,8 @@
+ 		/* touch172: keep the handshake byte clear for the whole run, not just
+ 		 * once after boot.  If the firmware sets it and nobody clears it, it
+ 		 * stops scanning ~18 s in and the report area turns to 0xfd. */
+-		if (tch_fw_status_byte() != 0x00 && ++tch_status_clears <= 8) {
++		const uint8_t status_byte = tch_fw_status_byte();
++		if (status_byte != 0x00 && status_byte != 0xff) {
+ 			tch_clear_fw_status("heartbeat");
+ 		}
+ 		/* Frame bookkeeping, and both revive paths, must stay *above* the
+@@ -5330,7 +5343,8 @@
+ 		 * fallback for a part that does not wake at all. */
+ 		/* Only a last resort: a panel that answers no interrupt at all.
+ 		 * A real touch asserts INT and the frame streak above reloads it. */
+-		if (tch_quiet_checks * (unsigned)period >= 300 &&
++		if (idle_recover_s >= 300 &&
++		    tch_quiet_checks * (unsigned)period >= idle_recover_s &&
+ 		    tch_fw_revive < TCH_REVIVE_MAX) {
+ 			tch_fw_revive++;
+ 			printf("LIUQIN TOUCH: revive %u: no contact frame for %u s, "

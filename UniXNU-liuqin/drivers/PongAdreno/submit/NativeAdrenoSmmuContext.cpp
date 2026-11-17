@@ -15,7 +15,7 @@ IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoMemory *tables,unsigned up
     config_=(ArmSmmu4KContextConfig){.lower=upper?nullptr:&arena_.config,.upper=upper?&arena_.config:nullptr,
         .lower_tables=upper?nullptr:&state_.tables,.upper_tables=upper?&state_.tables:nullptr,.id0=0,.id2=0,
         .asid=asid,.coherent_walk=1,.stall_on_fault=0,.continue_after_fault=1,.polled_faults=1,
-        .ignore_top_byte=(!upper && input_bits==32)?1u:0u,.shared_asid=1};
+        .ignore_top_byte=(!upper && (input_bits==32 || input_bits==36))?1u:0u,.shared_asid=1};
     tables_=tables;bank_=bank;poll_budget_=poll_budget;prepared_=true;
     return kIOReturnSuccess;
 }

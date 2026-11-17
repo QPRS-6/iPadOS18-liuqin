@@ -1,0 +1,53 @@
+From: Pong liuqin integration
+Subject: [PATCH] turnip: publish private memory capacity only after BO allocation
+
+An allocation failure must leave the device's previous private memory BO and
+capacity intact. Previously the larger capacity was published with a null BO,
+so a later pipeline skipped the allocation and dereferenced it in get_ref.
+Existing shaders retain the previous BO through their independent references.
+
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2862,24 +2862,31 @@ tu_setup_pvtmem(struct tu_device *dev,
+    mtx_lock(&pvtmem_bo->mtx);
+ 
+    if (pvtmem_bo->per_fiber_size < pvtmem_bytes) {
+-      if (pvtmem_bo->bo)
+-         tu_bo_finish(dev, pvtmem_bo->bo);
+-
+-      pvtmem_bo->per_fiber_size =
+-         util_next_power_of_two(align(pvtmem_bytes, 512));
+-      pvtmem_bo->per_sp_size =
+-         align(pvtmem_bo->per_fiber_size *
+-                  dev->physical_device->info->fibers_per_sp,
+-               1 << 12);
++      const uint32_t per_fiber_size =
++          util_next_power_of_two(align(pvtmem_bytes, 512));
++      const uint32_t per_sp_size =
++         align(per_fiber_size *
++                   dev->physical_device->info->fibers_per_sp,
++                1 << 12);
+       uint32_t total_size =
+-         dev->physical_device->info->num_sp_cores * pvtmem_bo->per_sp_size;
++         dev->physical_device->info->num_sp_cores * per_sp_size;
+ 
+-      VkResult result = tu_bo_init_new(dev, NULL, &pvtmem_bo->bo, total_size,
++      struct tu_bo *replacement = NULL;
++      VkResult result = tu_bo_init_new(dev, NULL, &replacement, total_size,
+                                        TU_BO_ALLOC_INTERNAL_RESOURCE, "pvtmem");
+       if (result != VK_SUCCESS) {
+          mtx_unlock(&pvtmem_bo->mtx);
+          return result;
+       }
++      /* Publish capacity only with its backing. A failed growth must leave
++       * the previous allocation usable: otherwise a later shader skips this
++       * allocation and tu_bo_get_ref dereferences a null BO. Existing shaders
++       * retain their own reference to the previous allocation. */
++      if (pvtmem_bo->bo)
++         tu_bo_finish(dev, pvtmem_bo->bo);
++      pvtmem_bo->bo = replacement;
++      pvtmem_bo->per_fiber_size = per_fiber_size;
++      pvtmem_bo->per_sp_size = per_sp_size;
+    }
+ 
+    config->per_wave = per_wave;

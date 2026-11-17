@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4395,6 +4395,19 @@
+ #endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
++#if defined(__arm64__)
++		/* Owner116: record the provider and result of every HID user-client
++		 * open (and of any failure) so a missing system HID device can be
++		 * attributed. Bounded in the callee. */
++		{
++			extern void pong_bt_user_client_trace(const char *, unsigned, int, int);
++			const char *providerName = service->getName();
++			if (res != kIOReturnSuccess ||
++			    (providerName && strnstr(providerName, "HID", strlen(providerName)))) {
++				pong_bt_user_client_trace(providerName ? providerName : "?", connect_type, (int)res, proc_selfpid());
++			}
++		}
++#endif
+ 
+ 		if (propertiesDict) {
+ 			propertiesDict->release();

@@ -20,7 +20,7 @@ use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, ResourceRef,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, StoreActionOptions, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -936,17 +936,26 @@ fn triple(v: *const u64) -> Result<[u64; 3], String> {
     Ok([v[0], v[1], v[2]])
 }
 
+fn host_byte_length(pointer: *const c_void, length: u64) -> Result<usize, String> {
+    if pointer.is_null() {
+        return Err("null bytes".into());
+    }
+    let length = usize::try_from(length).map_err(e("host byte length"))?;
+    if length > isize::MAX as usize || (pointer as usize).checked_add(length).is_none() {
+        return Err("host byte span overflow".into());
+    }
+    Ok(length)
+}
+
 /// # Safety
 /// `bytes` holds `length` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_texture_replace(texture: *mut NmbTexture, region_words: *const u64, level: u64, slice: u64,
                                              bytes: *const c_void, bytes_per_row: u64, bytes_per_image: u64, length: u64) -> bool {
     guard(false, || {
-        if bytes.is_null() {
-            return Err("null bytes".into());
-        }
+        let length = host_byte_length(bytes, length)?;
         // SAFETY: the caller's contract.
-        let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length as usize) };
+        let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) };
         get(texture)?.0.replace_region(region(region_words)?, level, slice, bytes, bytes_per_row, bytes_per_image)
             .map_err(e("replace region"))?;
         Ok(true)
@@ -959,11 +968,9 @@ pub unsafe extern "C" fn nmb_texture_replace(texture: *mut NmbTexture, region_wo
 pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes: *mut c_void, bytes_per_row: u64, bytes_per_image: u64,
                                                length: u64, region_words: *const u64, level: u64, slice: u64) -> bool {
     guard(false, || {
-        if bytes.is_null() {
-            return Err("null bytes".into());
-        }
+        let length = host_byte_length(bytes, length)?;
         // SAFETY: the caller's contract.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, length as usize) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, length) };
         get(texture)?.0.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, level, slice)
             .map_err(e("get bytes"))?;
         Ok(true)
@@ -972,7 +979,7 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes
 
 // ---- libraries and functions ----
 
-pub struct NmbLibrary(Library, Vec<String>);
+pub struct NmbLibrary(Library, Vec<String>, Vec<String>);
 pub struct NmbFunction(Function);
 
 /// # Safety
@@ -986,13 +993,19 @@ pub unsafe extern "C" fn nmb_library_new(device: *mut NmbDevice, bytes: *const c
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) };
-        let library = if air {
-            device.new_library_with_compile_library(metal2vulkan::library::Library::from_air(bytes).map_err(e("AIR"))?)
+        let compiled = if air {
+            metal2vulkan::library::Library::from_air(bytes).map_err(e("AIR"))?
         } else {
-            device.new_library_with_data(crate::air_slice(bytes).ok_or("metallib without an AIR64 slice")?).map_err(e("metallib"))?
+            metal2vulkan::library::Library::from_metallib(crate::air_slice(bytes).ok_or("metallib without an AIR64 slice")?).map_err(e("metallib"))?
         };
+        // Apple's externFunctionNames enumerates TYPE5 Core Image kernel
+        // entries, not TYPE4 visible functions or TYPE3 dynamic exports.
+        // Use the translator's checked container table, never a second parser.
+        let externs = compiled.functions().filter(|f| f.stage == metal2vulkan::library::FunctionStage::Other(5))
+            .map(|f| f.name.to_owned()).collect();
+        let library = device.new_library_with_compile_library(compiled);
         let names = library.function_names();
-        Ok(boxed(NmbLibrary(library, names)))
+        Ok(boxed(NmbLibrary(library, names, externs)))
     })
 }
 
@@ -1607,9 +1620,36 @@ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuf
     })
 }
 
+fn command_buffer_error_text(command_buffer: &CommandBuffer) -> Option<String> {
+    use metal2vulkan_runtime::CommandBufferError;
+    let error = command_buffer.error()?;
+    let mut text = format!("{error:?}");
+    if let Some(description) = command_buffer.error_description().filter(|s| !s.is_empty()) {
+        text.push_str(": ");
+        text.push_str(&description);
+    }
+    // Only completed failures need these detail getters; do not settle an
+    // encoder or wait for work merely because a caller queries error early.
+    match error {
+        CommandBufferError::Refused | CommandBufferError::CallRefused(_) => {
+            if let Some(refusal) = command_buffer.refusal() {
+                text.push_str(&format!("; refusal={refusal:?}"));
+            }
+        }
+        CommandBufferError::PipelineCreation(_) => {
+            if let Some(pipeline) = command_buffer.failed_pipeline() {
+                text.push_str(&format!("; pipeline encoder={} draw={} error={:?}",
+                    pipeline.encoder, pipeline.draw, pipeline.error));
+            }
+        }
+        _ => {}
+    }
+    Some(text)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
-    guard(0, || Ok(get(command_buffer)?.0.error_description().map_or(0, |text| copy_out(&text, out, size))))
+    guard(0, || Ok(command_buffer_error_text(&get(command_buffer)?.0).map_or(0, |text| copy_out(&text, out, size))))
 }
 
 #[unsafe(no_mangle)]
@@ -1865,6 +1905,7 @@ pub struct NmbPassAttachment {
     pub depth_plane: u64,
     pub load: u64,
     pub store: u64,
+    pub store_options: u64,
     pub clear: [f64; 4],
     pub resolve_texture: *mut NmbTexture,
     pub resolve_level: u64,
@@ -1884,6 +1925,22 @@ pub struct NmbRenderPassDescriptor {
     pub samples: u64,
     pub visibility: *const NmbBuffer,
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_library_extern_count(library: *const NmbLibrary) -> u32 {
+    guard(0, || Ok(get(library)?.2.len() as u32))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_library_extern_name(library: *const NmbLibrary, index: u32, out: *mut c_char, size: usize) -> usize {
+    guard(0, || Ok(copy_out(get(library)?.2.get(index as usize).ok_or("extern function index")?, out, size)))
+}
+
+const _: () = assert!(std::mem::size_of::<NmbPassAttachment>() == 128);
+const _: () = assert!(std::mem::offset_of!(NmbPassAttachment, store_options) == 48);
+const _: () = assert!(std::mem::offset_of!(NmbPassAttachment, clear) == 56);
+const _: () = assert!(std::mem::offset_of!(NmbPassAttachment, resolve_texture) == 88);
+const _: () = assert!(std::mem::size_of::<NmbRenderPassDescriptor>() == 1320);
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
@@ -1906,6 +1963,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
             slot.depth_plane = a.depth_plane;
             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
+            slot.store_action_options = StoreActionOptions::from_raw(a.store_options).map_err(e("store action options"))?;
             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
         }
         let depth = &mut pass.depth_attachment;
@@ -1920,6 +1978,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.depth_plane = d.depth.depth_plane;
         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
+        depth.store_action_options = StoreActionOptions::from_raw(d.depth.store_options).map_err(e("store action options"))?;
         depth.clear_depth = d.depth.clear[0];
         let stencil = &mut pass.stencil_attachment;
         stencil.texture = texture_of(&d.stencil)?;
@@ -1933,6 +1992,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         stencil.depth_plane = d.stencil.depth_plane;
         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
+        stencil.store_action_options = StoreActionOptions::from_raw(d.stencil.store_options).map_err(e("store action options"))?;
         stencil.clear_stencil = d.stencil.clear[0] as u32;
         pass.render_target_width = d.width;
         pass.render_target_height = d.height;
@@ -1981,6 +2041,60 @@ fn render<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut RenderCommandEncoder, 
         NmbEncoder::Render(r) => Ok(r),
         _ => Err("not a render encoder".into()),
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_color_store_action(encoder: *mut NmbEncoder, action: u64, index: u32) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
+        render(encoder)?.set_color_store_action(action, index).map_err(e("set color store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_depth_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
+        render(encoder)?.set_depth_store_action(action).map_err(e("set depth store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_stencil_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
+        render(encoder)?.set_stencil_store_action(action).map_err(e("set stencil store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_color_store_action_options(encoder: *mut NmbEncoder, options: u64, index: u32) -> bool {
+    guard(false, || {
+        let options = StoreActionOptions::from_raw(options).map_err(e("store action options"))?;
+        render(encoder)?.set_color_store_action_options(options, index).map_err(e("set color store action options"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_depth_store_action_options(encoder: *mut NmbEncoder, options: u64) -> bool {
+    guard(false, || {
+        let options = StoreActionOptions::from_raw(options).map_err(e("store action options"))?;
+        render(encoder)?.set_depth_store_action_options(options).map_err(e("set depth store action options"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_stencil_store_action_options(encoder: *mut NmbEncoder, options: u64) -> bool {
+    guard(false, || {
+        let options = StoreActionOptions::from_raw(options).map_err(e("store action options"))?;
+        render(encoder)?.set_stencil_store_action_options(options).map_err(e("set stencil store action options"))?;
+        Ok(true)
+    })
 }
 
 fn blit<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut BlitCommandEncoder, String> {
@@ -2269,6 +2383,73 @@ pub extern "C" fn nmb_blit_copy_texture(encoder: *mut NmbEncoder, source: *mut N
         blit(encoder)?.copy_from_texture_to_texture(&get(source)?.0, source_slice, source_level, origin(source_origin)?, size(extent)?,
                                                     &get(destination)?.0, destination_slice, destination_level,
                                                     origin(destination_origin)?).map_err(e("texture copy"))?;
+        Ok(true)
+    })
+}
+
+#[repr(C)]
+pub struct NmbAttachmentCopy {
+    pub source: *mut NmbTexture,
+    pub destination: *mut NmbTexture,
+    pub source_level: u64,
+    pub source_slice: u64,
+    pub destination_level: u64,
+    pub destination_slice: u64,
+    pub source_origin: [u64; 3],
+    pub destination_origin: [u64; 3],
+    pub size: [u64; 3],
+    pub aspect: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<NmbAttachmentCopy>() == 128);
+const _: () = assert!(std::mem::offset_of!(NmbAttachmentCopy, source_origin) == 48);
+const _: () = assert!(std::mem::offset_of!(NmbAttachmentCopy, size) == 96);
+const _: () = assert!(std::mem::offset_of!(NmbAttachmentCopy, aspect) == 120);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_blit_copy_attachment(encoder: *mut NmbEncoder, copy: *const NmbAttachmentCopy) -> bool {
+    guard(false, || {
+        let c = get(copy)?;
+        let source = &get(c.source)?.0;
+        let destination = &get(c.destination)?.0;
+        let encoder = blit(encoder)?;
+        let extent = size(c.size.as_ptr())?;
+        let from = origin(c.source_origin.as_ptr())?;
+        let to = origin(c.destination_origin.as_ptr())?;
+        use metal2vulkan::vk::ImageAspectFlags;
+        let wanted = match c.aspect {
+            0 => ImageAspectFlags::COLOR,
+            1 => ImageAspectFlags::DEPTH,
+            2 => ImageAspectFlags::STENCIL,
+            _ => return Err("invalid attachment copy aspect".into()),
+        };
+        let aspects = metal2vulkan::metal::format::aspects(source.pixel_format());
+        if !aspects.is_some_and(|flags| flags.contains(wanted)) || source.pixel_format() != destination.pixel_format()
+            || source.sample_count() != 1 || destination.sample_count() != 1 {
+            return Err("single-sample attachment copy has an invalid aspect or format pair".into());
+        }
+        let combined = matches!(source.pixel_format(), PixelFormat::Depth32FloatStencil8 | PixelFormat::Depth24UnormStencil8);
+        if c.aspect == 0 || !combined {
+            encoder.copy_from_texture_to_texture(source, c.source_slice, c.source_level, from, extent,
+                destination, c.destination_slice, c.destination_level, to).map_err(e("attachment copy"))?;
+        } else {
+            // A texture-to-texture blit copies both aspects. Use the runtime's
+            // public aspect blits through GPU-private staging so a late depth
+            // store cannot overwrite stencil (or the converse).
+            let (option, unit) = match c.aspect {
+                1 => (BlitOption::DepthFromDepthStencil, 4),
+                _ => (BlitOption::StencilFromDepthStencil, 1),
+            };
+            let row = c.size[0].checked_mul(unit).and_then(|n| n.checked_add(255))
+                .map(|n| n & !255).ok_or("attachment copy row overflow")?;
+            let image = row.checked_mul(c.size[1]).ok_or("attachment copy image overflow")?;
+            let length = image.checked_mul(c.size[2]).ok_or("attachment copy length overflow")?;
+            let staging = source.device().new_buffer(length, ResourceOptions::private()).map_err(e("attachment copy staging"))?;
+            encoder.copy_from_texture_to_buffer(source, c.source_slice, c.source_level, from, extent,
+                &staging, 0, row, image, option).map_err(e("attachment aspect read"))?;
+            encoder.copy_from_buffer_to_texture(&staging, 0, row, image, extent,
+                destination, c.destination_slice, c.destination_level, to, option).map_err(e("attachment aspect write"))?;
+        }
         Ok(true)
     })
 }

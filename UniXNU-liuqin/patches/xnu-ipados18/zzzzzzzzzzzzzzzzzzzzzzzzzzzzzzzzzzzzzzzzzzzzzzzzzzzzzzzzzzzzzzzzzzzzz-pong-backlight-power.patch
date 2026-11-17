@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -65,6 +65,7 @@
+ #endif
+ #if XNU_PONG_BACKLIGHT
+ extern "C" void pong_backlight_start(IOService *display);
++extern "C" void pong_backlight_power(unsigned state);
+ #endif
+ 
+ 
+@@ -1923,8 +1924,13 @@
+ 	case kFBMethodSwapSignal:
+ 	case kFBMethodSwapCancel:
+ 	case kFBMethodSwapCancelAll:
+-	case kFBMethodRequestPowerChange:
+ 	case kFBMethodChangeFrameInfo:
+ 		return kIOReturnSuccess;
++	case kFBMethodRequestPowerChange:
++		if (args->scalarInputCount != 1 || in[0] > 1) return kIOReturnBadArgument;
++#if XNU_PONG_BACKLIGHT
++		pong_backlight_power((unsigned)in[0]);
++#endif
++		return kIOReturnSuccess;
+ 
+ 	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */

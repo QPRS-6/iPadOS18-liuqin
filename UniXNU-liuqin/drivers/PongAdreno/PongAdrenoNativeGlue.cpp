@@ -49,7 +49,7 @@ bool PongAdrenoPublishClient(PongCpBackend *device)
     if(backend || !device || !device->healthy())return false;
     backend=device;
     const IOReturn result=native_adreno_publish(device->vm,device->submit,device->ring,
-        &device->clock,device->timer,&device->info,32,device->output_bits);
+        &device->clock,device->timer,&device->info,device->input_bits,device->output_bits);
     if(result)return false;
     if(!PongAdrenoConfigureService(native_adreno_published_service()))return false;
     unsigned metal=0;

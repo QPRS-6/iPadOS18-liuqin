@@ -1,0 +1,78 @@
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -398,6 +398,9 @@
+ 
+    mtx_t vma_mutex;
+    struct util_vma_heap vma;
++   /* A KMD may acquire a different address lease when the device is opened
++    * than the temporary connection used for physical-device enumeration. */
++   uint64_t va_start, va_size;
+ 
+    /* bo list for submits: */
+    struct drm_msm_gem_submit_bo *submit_bo_list;
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2873,6 +2873,8 @@
+    device->instance = physical_device->instance;
+    device->physical_device = physical_device;
+    device->device_idx = device->physical_device->device_count++;
++   device->va_start = physical_device->va_start;
++   device->va_size = physical_device->va_size;
+ 
+    result = tu_drm_device_init(device);
+    if (result != VK_SUCCESS) {
+@@ -2911,8 +2913,8 @@
+ 
+    if (physical_device->has_set_iova) {
+       mtx_init(&device->vma_mutex, mtx_plain);
+-      util_vma_heap_init(&device->vma, physical_device->va_start,
+-                         ROUND_DOWN_TO(physical_device->va_size, os_page_size));
++      util_vma_heap_init(&device->vma, device->va_start,
++                         ROUND_DOWN_TO(device->va_size, os_page_size));
+    }
+ 
+    if (TU_DEBUG(BOS))
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -992,6 +992,27 @@
+ 
+ /* ---- device ---- */
+ 
++static bool
++darwin_bind_current_window(struct tu_device *dev, const NativeAdrenoAbiParams *params,
++                           const NativeAdrenoAbiDeviceInfo *info)
++{
++   const struct tu_physical_device *physical = dev->physical_device;
++   if (params->abi_version != NativeAdrenoAbiVersion || params->input_bits < 32 || params->input_bits > 48 ||
++       !physical->has_set_iova || !(info->flags & NativeAdrenoDeviceClientIova) ||
++       info->chip_id != physical->dev_id.chip_id || info->gmem_bytes != physical->gmem_size ||
++       info->gmem_base != physical->gmem_base || info->uche_trap_base != physical->uche_trap_base ||
++       !info->va_start || !info->va_size || ((info->va_start | info->va_size) & (os_page_size - 1)) ||
++       info->va_start >= (1ULL << params->input_bits) ||
++       info->va_size > (1ULL << params->input_bits) - info->va_start ||
++       info->va_size != physical->va_size)
++      return false;
++   /* Generic CreateDevice initializes its heap after this KMD callback.
++    * The physical-device probe's start is not a retained kernel lease. */
++   dev->va_start = info->va_start;
++   dev->va_size = info->va_size;
++   return true;
++}
++
+ static VkResult
+ darwin_device_init(struct tu_device *dev)
+ {
+@@ -1002,6 +1023,13 @@
+       if (result != VK_SUCCESS)
+          return result;
+    }
++   if (!darwin_bind_current_window(dev, &dw.params, &dw.info)) {
++      dw_close_connection();
++      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED, "incompatible reopened GPU address lease");
++   }
++   fprintf(stderr, "Pong Turnip lease: pid=%d probe=0x%llx active=0x%llx bytes=%llu\n", getpid(),
++           (unsigned long long)dev->physical_device->va_start, (unsigned long long)dev->va_start,
++           (unsigned long long)dev->va_size);
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)
+       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (!retire) {

@@ -37,14 +37,26 @@ liuqin 的面板是 CSOT NT36532 TDDI LCD，背光不是上述 NT37705 DCS 路�
 - 先投票 QUP0 SE1 的 GCC 分支（`0x62008` 位 6/7/8/9/11），等 halt 寄存器报告运行后才访问 SE；
 - 协议不是 I2C 或引擎未配置时只记录并返回，保持 ABL 亮度，不写未知窗口；
 - 亮度为 11 位：`0x04` 低 3 位、`0x05` 高 8 位，最大 2047；`0x08` 位 6 是总使能，位 5:0 是电流 sink；
-- 每次写入后回读 `0x04/0x05` 并发布 `IODisplayParameters`，沿用 NT37705 版本的
-  `AppleARMBacklight` conformance 与 16.16 `FadePeriod` 渐变；
+- 每次写入后回读 `0x04/0x05`；liuqin 不再发布 AppleARMBacklight conformance、
+  `backlight-control` 或 `IODisplayParameters`。`publish=0` 保持私有内核通道，
+  `pong_backlight_publish=8` 只注册真实 `PongBacklight` 服务；其他试验掩码不再启用。
+- `kern.pong_backlight` 为已接受的 0–2047 目标值；user client 属性写入转发给驱动，
+  selector 0 返回目标与最大值。请求 CAS 合并，定时器与 I2C 仅在工作循环操作。
+- 用户态 `backlight_bks18.h` 检查 22H374 BackBoardServices UUID 与入口指令，
+  在 Preferences / SpringBoard 接 BKS 设置及读回，硬件通道失败则回到原实现。
 - 板级输入在 `configs/liuqin-board.json` 的 `display.backlight_i2c`，由
   `make-pong-adt-ipados18.py` 写成 `/chosen/pong-i2c-backlight`（`<Q6I`：基址、长度、使能 GPIO、
   地址、最大值、版本、保留）。
 
 构建时设置 `PONG_BACKLIGHT_KTZ8866=1` 选择该文件（不设置仍编 `PongBacklight.cpp`）。
-主机侧已编译；设备侧尚未验证亮度滑块、0 级关断和回读。
+音量键硬件调光已有用户观察与 keys2 日志。bks23 内核、dylib 和全量 root 已构建；
+设置/控制中心滑条、0 级关断和唤醒仍待该候选的设备测试。详见
+`../../docs/BACKLIGHT-AUDIT.zh.md`，不得把主机成功当成滑条已修复。
+
+用户已确认 queue23 / bks23 候选背光可用。后续最低亮度调整仅需换内核 shim：
+sysctl/BKS 滑条下限默认 102/2047（约 5%，不是光度测量），可用
+`pong_backlight_min=N` 修改。内部 `setProperties` 的显式 0 级请求仍保留关灯功能。
+按用户要求，backlight24 移除音量键调光钩子，原生 HID 按键上报保持不变。
 
 ## 来源与当前状态
 

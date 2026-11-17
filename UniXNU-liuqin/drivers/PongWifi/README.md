@@ -45,6 +45,13 @@ BDF 按 QMI chip/board ID 使用 Nothing CNSS2 的文件命名规则，AMSS 按
 
 ## 当前证据
 
+liuqin67基于GPU65/root35做boot-only试验，完整内核及shim构建通过，尚无真机
+扫描、关联或DHCP结果。显式 `PONG_WIFI_PROFILE` 选择liuqin六路WLAN供电，
+不启用Pong独有的IPA请求。固件来源为机主确认的liuqin官方
+OS3.0.7.0.VMYCNXM NON-HLOS.bin，不标记成当前活动槽捕获；实际chip/board
+仍选择BDF。运行时供电、PCIe、DMA/MSI、MAC与station发布条件不放宽。
+原GPU65与Native56配置保留，不带入Metal66的分配器或GMEM变更。
+
 真实 ath11k、PCI、MHI、QRTR、QMI、station 和网络代码已编译接入。
 services80 已观察到 PCIe/SMMU/MHI/QMI 完成和 102 个通道注册，之后发生
 MHI RDDM 固件崩溃；BSS 扫描、认证、地址配置及联网尚无成功证据。

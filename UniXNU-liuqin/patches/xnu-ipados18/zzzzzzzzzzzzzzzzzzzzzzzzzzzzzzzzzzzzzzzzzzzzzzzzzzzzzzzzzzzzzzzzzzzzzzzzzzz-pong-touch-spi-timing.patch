@@ -1,0 +1,122 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -686,6 +686,40 @@
+  * and makes the pace argument mean something.
+  */
+ static uint32_t bb_spin_per_us = 60;    /* calibrated at bring-up */
++/* Observation only: do not mask interrupts, change SPI pacing or schedule
++ * synthetic work. Byte timing is enabled only while a report owns SPI. */
++static bool tch_bb_time_report;
++static uint64_t tch_bb_max_byte_abs;
++struct tch_report_time { uint64_t id, end_us, total_us, byte_us; };
++static struct tch_report_time tch_report_time_current; /* report thread only */
++static uint64_t tch_report_time_id;
++struct tch_report_timing {
++	struct tch_report_time last, good, first_fd;
++	uint64_t max_total_us, max_byte_us;
++	bool watchdog;
++};
++static struct tch_report_timing tch_report_timings;
++static unsigned tch_timing_owner, tch_timing_skips;
++
++static void
++tch_record_report_timing(bool good, bool watchdog)
++{
++	unsigned expected = 0;
++	/* Diagnostics must never wait on a preempted snapshot reader. */
++	if (!__atomic_compare_exchange_n(&tch_timing_owner, &expected, 1, false,
++	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++		(void)__atomic_add_fetch(&tch_timing_skips, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	struct tch_report_timing *t = &tch_report_timings;
++	t->last = tch_report_time_current;
++	if (good) t->good = t->last;
++	if (watchdog && !t->watchdog) t->first_fd = t->last;
++	t->watchdog = watchdog;
++	if (t->last.total_us > t->max_total_us) t->max_total_us = t->last.total_us;
++	if (t->last.byte_us > t->max_byte_us) t->max_byte_us = t->last.byte_us;
++	__atomic_store_n(&tch_timing_owner, 0, __ATOMIC_RELEASE);
++}
+ 
+ static void
+ bb_calibrate(void)
+@@ -739,6 +773,7 @@
+ {
+ 	const int idle = tch.bb_cpol;           /* clock level between bits */
+ 	const int cpha = tch.bb_cpha;
++	uint64_t byte_start = tch_bb_time_report ? mach_absolute_time() : 0;
+ 
+ 	for (size_t i = 0; i < len; i++) {
+ 		const uint8_t out = tx != NULL ? tx[i] : 0xff;
+@@ -764,6 +799,12 @@
+ 		}
+ 		if (rx != NULL) {
+ 			rx[i] = in;
++		}
++		if (tch_bb_time_report) {
++			const uint64_t end = mach_absolute_time();
++			const uint64_t elapsed = end - byte_start;
++			if (elapsed > tch_bb_max_byte_abs) tch_bb_max_byte_abs = elapsed;
++			byte_start = end;
+ 		}
+ 	}
+ }
+@@ -2029,7 +2070,20 @@
+ {
+ 	uint8_t report[NVT_EVENT_BLOCK_LEN - 1];
+ 	_Static_assert(sizeof(report) >= NVT_POINT_LEN, "report must contain the touch prefix");
+-	const int err = tch_nvt_read(NVT_EVENT_BUF_ADDR, report, sizeof(report));
++	if (!tch_spi_acquire()) return -1;
++	const uint64_t start = mach_absolute_time();
++	tch_bb_max_byte_abs = 0;
++	tch_bb_time_report = tch.bitbang;
++	const int err = tch_nvt_read_locked(NVT_EVENT_BUF_ADDR, report, sizeof(report));
++	const uint64_t end = mach_absolute_time();
++	tch_bb_time_report = false;
++	uint64_t end_ns, total_ns, byte_ns;
++	absolutetime_to_nanoseconds(end, &end_ns);
++	absolutetime_to_nanoseconds(end - start, &total_ns);
++	absolutetime_to_nanoseconds(tch_bb_max_byte_abs, &byte_ns);
++	tch_report_time_current = (struct tch_report_time){ ++tch_report_time_id,
++	    end_ns / NSEC_PER_USEC, total_ns / NSEC_PER_USEC, byte_ns / NSEC_PER_USEC };
++	tch_spi_release();
+ 	if (err == 0) memcpy(frame, report, NVT_POINT_LEN);
+ 	return err;
+ }
+@@ -4703,6 +4757,27 @@
+ 	(void)tch_nvt_read(NVT_CRC_ERR_FLAG, &crc, 1);
+ 	printf("LIUQIN TOUCH: fault %u %s time_ms=%u gpio21=%d state=%02x crc_latch=%02x contacts=%u\n",
+ 	    capture, why, tch_ms_since(0), bb_get(21), state, crc, tch_valid_frames);
++	struct tch_report_timing timing;
++	unsigned expected = 0;
++	if (__atomic_compare_exchange_n(&tch_timing_owner, &expected, 1, false,
++	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++		timing = tch_report_timings;
++		__atomic_store_n(&tch_timing_owner, 0, __ATOMIC_RELEASE);
++		const struct tch_report_time rows[] = { timing.last, timing.good, timing.first_fd };
++		for (unsigned i = 0; i < 3; i++)
++			printf("LIUQIN TOUCH: timing %u %s id=%llu end_us=%llu read_us=%llu byte_max_us=%llu\n",
++			    capture, i == 0 ? "last" : i == 1 ? "good" : "first_fd",
++			    rows[i].id, rows[i].end_us, rows[i].total_us, rows[i].byte_us);
++		printf("LIUQIN TOUCH: timing %u peaks read_us=%llu byte_us=%llu skipped=%u\n",
++		    capture, timing.max_total_us, timing.max_byte_us,
++		    __atomic_load_n(&tch_timing_skips, __ATOMIC_RELAXED));
++	} else {
++		printf("LIUQIN TOUCH: timing %u SKIP snapshot busy\n", capture);
++	}
++	uint8_t command[4] = { 0 };
++	const int command_err = tch_nvt_read(NVT_EVENT_BASE + 0x50u, command, sizeof(command));
++	printf("LIUQIN TOUCH: mailbox %u addr=125850 status=%d bytes=%02x %02x %02x %02x\n",
++	    capture, command_err, command[0], command[1], command[2], command[3]);
+ 	for (unsigned bank = 0; bank < 2; bank++) {
+ 		uint8_t bytes[64] = { 0 };
+ 		if (tch_nvt_read(history[bank], bytes, sizeof(bytes)) != 0) {
+@@ -4863,6 +4938,7 @@
+ 	for (unsigned i = 0; i < 6 * NVT_MAX_FINGERS; i++) {
+ 		if (frame[i] != 0xff) { empty = false; break; }
+ 	}
++	tch_record_report_timing(healthy || empty, watchdog);
+ 	__atomic_store_n(&tch_watchdog_report, watchdog, __ATOMIC_RELEASE);
+ 	if (healthy || empty)
+ 		(void)__atomic_add_fetch(&tch_good_reports, 1, __ATOMIC_RELEASE);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef NATIVE_ADRENO_SUBMIT_H
 #define NATIVE_ADRENO_SUBMIT_H
+#include "NativeAdrenoABI.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 
@@ -50,7 +51,7 @@ class NativeAdrenoSubmit final {
     uint64_t slow_window_=0;unsigned slow_logged_=0;
     uint64_t admission_yields_=0;
     struct AcquiredWindow {uint64_t start=0,bytes=0;uint32_t completed=0;bool valid=false;};
-    AcquiredWindow acquired_[16]{};
+    AcquiredWindow acquired_[NativeAdrenoAbiMaxClientScopes]{};
     /* Serialized by the owner; a 128-IB batch must not consume kernel stack
      * with its 1 KiB handle list and 2 KiB packet list. */
     uint64_t scratch_handles_[128]{};

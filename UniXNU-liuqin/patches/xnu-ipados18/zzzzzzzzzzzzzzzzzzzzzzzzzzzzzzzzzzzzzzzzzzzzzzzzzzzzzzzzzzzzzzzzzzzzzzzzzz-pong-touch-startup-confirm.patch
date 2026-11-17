@@ -1,0 +1,28 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -5335,6 +5335,14 @@
+ 	if (keepalive_ms) {
+ 		printf("LIUQIN TOUCH: keep-alive: poking INT every %u ms\n", keepalive_ms);
+ 	}
++	/* Initial BOOTED is also provisional. A normal packet (including an
++	 * empty all-FF report) confirms startup without requiring a finger.
++	 * Retry only persistent FD/FE when that confirmation never arrived;
++	 * the same bounded cooldown used after watchdog reloads applies. */
++	recovery_pending = true;
++	recovery_baseline = 0; /* include normal reports read before this thread ran */
++	clock_interval_to_deadline(15, NSEC_PER_SEC, &recovery_due);
++	printf("LIUQIN TOUCH: startup awaiting normal report; FD/FE retry gap 15 s\n");
+ 	for (;;) {
+ 		bool running;
+ 		const int period = keepalive_ms ? (int)(keepalive_ms / 1000 ? keepalive_ms / 1000 : 1) : 5;
+@@ -5382,8 +5390,8 @@
+ 				recovery_attempts = 0;
+ 			} else if (mach_absolute_time() >= recovery_due &&
+ 			    __atomic_load_n(&tch_watchdog_report, __ATOMIC_ACQUIRE)) {
+-				/* A previously confirmed watchdog fault has not recovered.
+-				 * No new IRQ is required; ordinary idle alone never enters here. */
++				/* Boot/reload has not produced a normal report and the latest
++				 * successful read is the watchdog fill. Idle alone is insufficient. */
+ 				tch_fault_history("watchdog-retry");
+ 				printf("LIUQIN TOUCH: recovery unconfirmed: FD/FE persists after attempt %u; retrying\n",
+ 				    recovery_attempts);

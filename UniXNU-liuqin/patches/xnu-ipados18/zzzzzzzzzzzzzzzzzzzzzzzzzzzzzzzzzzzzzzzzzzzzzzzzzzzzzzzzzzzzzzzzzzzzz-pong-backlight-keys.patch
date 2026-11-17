@@ -1,0 +1,54 @@
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -9,7 +9,13 @@
+ #include <libkern/libkern.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/pexpert.h>
++
++/* Provided by the PongPower backlight driver when it is built in. */
++/* Volume keys retain their native HID route; no brightness callback. */
++extern int pong_backlight_set(int level, int *applied) __attribute__((weak));
++extern int pong_backlight_get(int *level) __attribute__((weak));
+ #include <sys/pong_input.h>
++#include <sys/sysctl.h>
+ #include <sys/systm.h>
+ extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -25,6 +31,37 @@
+ struct key {bool usable,live,last,down;uint32_t code;};
+ static struct key keys[3]={{.code=PONG_BUTTON_POWER},{.code=PONG_BUTTON_VOLUME_UP},
+     {.code=PONG_BUTTON_VOLUME_DOWN}};
++
++/*
++ * kern.pong_backlight: absolute KTZ8866 level (0..maximum). libpong-ui in
++ * SpringBoard writes it from the native brightness controller. Publishing an
++ * AppleARMBacklight service instead makes CoreBrightness throttle this port's
++ * display to a fraction of a frame per second, so brightness stays out of IOKit.
++ */
++static int
++sysctl_pong_backlight SYSCTL_HANDLER_ARGS
++{
++	int level = 0, applied = 0, error;
++
++	if (!pong_backlight_set || !pong_backlight_get) {
++		return ENXIO;
++	}
++	if (req->newptr != NULL) {
++		error = sysctl_handle_int(oidp, &level, 0, req);
++		if (error != 0 || req->newptr == NULL) {
++			return error;
++		}
++		if (pong_backlight_set(level, &applied) < 0) {
++			return ENXIO;
++		}
++		return 0;
++	}
++	if (pong_backlight_get(&level) < 0) return ENXIO;
++	return sysctl_handle_int(oidp, &level, 0, req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, pong_backlight,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    sysctl_pong_backlight, "I", "Pong LCD backlight level");
+ static uint32_t rd(vm_offset_t a) {return *(volatile uint32_t *)a;}
+ static void wr(vm_offset_t a,uint32_t v) {*(volatile uint32_t *)a=v;__asm__ volatile("dsb sy":::"memory");}
+ 
